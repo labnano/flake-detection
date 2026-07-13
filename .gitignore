@@ -1,0 +1,12 @@
+# Ambiente virtual
+.venv/
+
+# Cache do Python
+__pycache__/
+*.pyc
+
+# Pesos do modelo (325MB+301MB, excedem o limite do GitHub -- baixar separadamente)
+modelo/
+
+# Configuração local da IDE (PyCharm)
+.idea/

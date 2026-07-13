@@ -1,0 +1,265 @@
+import os
+import numpy as np
+import cv2
+from tifffile import imwrite
+from pycromanager import Core
+import datetime
+import csv
+from modelo import obter_predictor, display_results
+from capturar_imagem import capturar_imagem
+from caminhos import DIRETORIO_SAIDA_BASE
+from parametros import (
+    FOV_DETECCAO,
+    EXPOSICAO_DETECCAO,
+    WHITE_BALANCE_RED,
+    WHITE_BALANCE_BLUE,
+)
+from comandos import (
+    calibrar_plano_foco,
+    calibrar_superficie_foco,
+    calcular_z,
+    coletar_pontos_calibracao,
+    gerar_malha_varredura,
+)
+
+predictor = obter_predictor()
+
+# --- CONFIGURAÇÕES DE DIRETÓRIO ---
+timestamp = datetime.datetime.now().strftime('%d-%m-%Y_%H-%M-%S')
+diretorio_saida = os.path.join(DIRETORIO_SAIDA_BASE, "Varredura_" + timestamp)
+diretorio_conferencia = os.path.join(diretorio_saida, "_conferencia")
+
+os.makedirs(diretorio_saida, exist_ok=True)
+os.makedirs(diretorio_conferencia, exist_ok=True)
+
+arquivo_log = os.path.join(diretorio_saida, "coordenadas_flakes_" + timestamp + ".csv")
+
+with open(arquivo_log, mode='w', newline='', encoding='utf-8-sig') as file:
+    writer = csv.writer(file, delimiter=';')
+    writer.writerow(["Nome_Arquivo", "X", "Y", "Z", "Qtd_Flakes"])
+
+# --- CONFIGURAÇÕES DE AUTOFOCO (parte B) ---
+# A cada INTERVALO_AUTOFOCO imagens, em vez de confiar só no modelo de
+# foco (plano/superfície), o script tira um pequeno "stack" de fotos em
+# Z ao redor do valor previsto e fica com a mais nítida.
+INTERVALO_AUTOFOCO = 20
+AUTOFOCO_FAIXA_UM = 3.0   # quantos µm pra cada lado do Z previsto ele varre
+AUTOFOCO_PASSO_UM = 0.5   # espaçamento entre as fotos do stack
+
+
+# --- CÁLCULOS ---
+def medir_nitidez(imagem):
+    """
+    Mede o quão nítida (em foco) uma imagem está, usando a variância do
+    Laplaciano -- quanto maior o valor, mais nítida a imagem está.
+    É a métrica clássica de autofoco por imagem em microscopia.
+    """
+
+    cinza = cv2.cvtColor(imagem, cv2.COLOR_RGB2GRAY) if imagem.ndim == 3 else imagem
+    return cv2.Laplacian(cinza, cv2.CV_64F).var()
+
+
+def autofocar(core, z_stage, camera, z_estimado):
+    """
+    Faz uma pequena varredura fina em Z ao redor de z_estimado (o Z que o
+    modelo de foco previu) e fica com a posição mais nítida encontrada.
+
+    Retorna o Z escolhido e a imagem já capturada nele, pra não precisar
+    tirar outra foto depois.
+    """
+
+    melhor_z = z_estimado
+    melhor_nitidez = -1.0
+    melhor_imagem = None
+
+    for delta in np.arange(-AUTOFOCO_FAIXA_UM, AUTOFOCO_FAIXA_UM + AUTOFOCO_PASSO_UM, AUTOFOCO_PASSO_UM):
+        z_teste = z_estimado + delta
+
+        core.set_position(z_stage, z_teste)
+        core.wait_for_device(z_stage)
+
+        imagem = capturar_imagem(core, camera)
+        nitidez = medir_nitidez(imagem)
+
+        if nitidez > melhor_nitidez:
+            melhor_nitidez = nitidez
+            melhor_z = z_teste
+            melhor_imagem = imagem
+
+    # Deixa o estágio de fato parado na melhor posição encontrada.
+    core.set_position(z_stage, melhor_z)
+    core.wait_for_device(z_stage)
+
+    return melhor_z, melhor_imagem
+
+
+core = Core()
+
+# Identificação de Hardware
+camera = core.get_camera_device()
+xy_stage = core.get_xy_stage_device()
+z_stage = core.get_focus_device()
+
+fov_x, fov_y = FOV_DETECCAO
+
+malha = gerar_malha_varredura(core, xy_stage, fov_x, fov_y)
+malha_x = malha["malha_x"]
+malha_y = malha["malha_y"]
+x_inicial = malha["x_inicial"]
+y_inicial = malha["y_inicial"]
+dist_x = malha["dist_x"]
+dist_y = malha["dist_y"]
+qtd_passos_x = malha["qtd_passos_x"]
+qtd_passos_y = malha["qtd_passos_y"]
+
+# --- ESCOLHA DO METODO DE CALIBRAÇÃO DE FOCO ---
+print("\n--- MÉTODO DE CALIBRAÇÃO DE FOCO ---")
+print("1. Plano (mais rápido, funciona bem se a amostra for praticamente plana)")
+print("2. Superfície curva/quadrática (mais precisa com lentes de magnificações maiores, porém exige mais pontos)")
+
+while True:
+    metodo = input("Escolha o método (1 ou 2): ").strip()
+
+    if metodo == "1":
+        minimo_pontos = 3
+        break
+    elif metodo == "2":
+        minimo_pontos = 6
+        break
+    else:
+        print("[Erro] Digite 1 ou 2.\n")
+
+print(f"Esse método precisa de pelo menos {minimo_pontos} pontos de calibração.\n")
+
+pontos_coletados = coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos)
+
+
+if metodo == "1":
+    modelo_foco = calibrar_plano_foco(pontos_coletados)
+else:
+    modelo_foco = calibrar_superficie_foco(pontos_coletados)
+
+print("\n[Sucesso] Modelo de foco calculado!")
+
+
+# ----- CÁLCULO DOS VALORES DE Z DA VARREDURA -----
+valores_z = []
+
+for n in malha_x:
+    for m in malha_y:
+        z_estimado = calcular_z(n, m, modelo_foco)
+        valores_z.append(z_estimado)
+
+if core.is_sequence_running():
+    core.stop_sequence_acquisition()
+
+
+print(f"\nÁrea a ser mapeada: {dist_x:.2f} x {dist_y:.2f} µm")
+print(f"Grade gerada: {qtd_passos_x} x {qtd_passos_y} imagens. Total: {qtd_passos_x * qtd_passos_y}")
+
+print("\n--- FAIXA DE FOCO ESTIMADA ---")
+print(f"Maior Z calculado: {max(valores_z):.3f}")
+print(f"Menor Z calculado: {min(valores_z):.3f}")
+
+input("Se estes valores forem seguros, aperte ENTER para iniciar a varredura...")
+
+print(f"\nIniciando captura. Arquivos serão salvos em: {diretorio_saida}")
+
+core.set_exposure(EXPOSICAO_DETECCAO)
+core.set_property(camera, "WhiteBalanceBlue", WHITE_BALANCE_BLUE)
+core.set_property(camera, "WhiteBalanceRed", WHITE_BALANCE_RED)
+
+# --- VARREDURA ---
+contador_imagem = 0
+ajuste_z = 0.0  #correção aprendida pelo autofoco
+
+try:
+    for i, n in enumerate(malha_x):
+        for j, m in enumerate(malha_y):
+            contador_imagem += 1
+
+            # 1. Calcula o foco previsto para a posição atual
+            z_previsto = calcular_z(n, m, modelo_foco) + ajuste_z
+
+            if not np.isfinite(z_previsto):
+                raise ValueError(f"Z calculado inválido em X={n}, Y={m}: Z={z_previsto}")
+
+            print(f"\nIndo para X={n:.2f}, Y={m:.2f}, Z previsto={z_previsto:.3f}")
+
+            # 2. Movimentação XY
+            core.set_xy_position(xy_stage, n, m)
+            core.wait_for_device(xy_stage)
+
+            if contador_imagem % INTERVALO_AUTOFOCO == 0:
+                # 3-4. A cada {INTERVALO_AUTOFOCO} imagens, refina o foco:
+                # Tira um pequeno stack em Z e fica com a mais nítida.
+                z_calculado, imagem_colorida = autofocar(core, z_stage, camera, z_previsto)
+
+                # A diferença entre o Z realmente mais nítido e o que o
+                # modelo (sem ajuste) previa vira o novo ajuste, e passa a
+                # valer para as próximas posições, até o próximo checkpoint.
+                ajuste_z = z_calculado - calcular_z(n, m, modelo_foco)
+
+                print(
+                    f"[Autofoco] Z ajustado para {z_calculado:.3f} "
+                    f"(ajuste acumulado: {ajuste_z:+.3f})"
+                )
+            else:
+                # 3. Movimentação Z direto pro valor previsto
+                core.set_position(z_stage, z_previsto)
+                core.wait_for_device(z_stage)
+
+                # 4. Captura da imagem
+                imagem_colorida = capturar_imagem(core, camera)
+                z_calculado = z_previsto
+
+            if i % 20 == 0 and j % 20 == 0:
+                nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
+                caminho_completo = os.path.join(diretorio_conferencia, nome_arquivo)
+
+                # 5. Salva a matriz no formato nativo, sem corromper os bits.
+                # imagem_colorida já é RGB (confirmado comparando um arquivo
+                imwrite(caminho_completo, imagem_colorida)
+                print(f"Salvo arquivo de conferência: {caminho_completo}")
+
+            # 6. Detecção
+            # O MaskTerial espera BGR (ver FlakeClass.py), então convertemos
+            # antes de mandar pro modelo.
+            flakes = predictor.predict(imagem_colorida[:, :, ::-1])
+
+            if flakes:
+                nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
+                caminho_completo = os.path.join(diretorio_saida, nome_arquivo)
+
+                nome_arquivo_flakes = f"flakes_pos_X{i}_Y{j}.tif"
+                caminho_completo_flakes = os.path.join(diretorio_saida, nome_arquivo_flakes)
+
+                # Salva imagem original
+                imwrite(caminho_completo, imagem_colorida)
+
+                # Salva imagem com flakes marcados.
+                # display_results também espera BGR (mesmo motivo do predict acima).
+                imagem_flakes = display_results(imagem_colorida[:, :, ::-1], flakes)
+                imwrite(caminho_completo_flakes, imagem_flakes[:, :, ::-1])
+
+                # Registra no CSV
+                with open(arquivo_log, mode='a', newline='', encoding='utf-8-sig') as file:
+                    writer = csv.writer(file, delimiter=';')
+                    writer.writerow([nome_arquivo, n, m, z_calculado, len(flakes)])
+
+                print(
+                    f"SUCESSO: {len(flakes)} flake(s) em "
+                    f"X={n:.1f}, Y={m:.1f}, Z={z_calculado:.3f}. "
+                    f"Salvo como {nome_arquivo}"
+                )
+
+            else:
+                print(f"Sem flakes em X={n:.1f}, Y={m:.1f}, Z={z_calculado:.3f}.")
+
+    print("\nVarredura totalmente concluída.")
+
+finally:
+    # 7. Retorno à origem, sempre executado (mesmo se algo tiver falhado acima).
+    print("\nRetornando o estágio à posição inicial...")
+    core.set_xy_position(xy_stage, x_inicial, y_inicial)
+    core.wait_for_device(xy_stage)
