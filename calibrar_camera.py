@@ -31,7 +31,7 @@ TAXA_APRENDIZADO = 0.5
 # Quando a diferença entre os canais for menor que isso (em fração, ex: 0.01 = 1%), consideramos que o balanço de branco convergiu.
 TOLERANCIA_BALANCO = 0.01
 
-MAX_ITERACOES_BALANCO = 20
+MAX_ITERACOES_BALANCO = 100
 
 
 def limitar_ao_intervalo_permitido(core, camera, nome_propriedade, valor):
@@ -43,6 +43,22 @@ def limitar_ao_intervalo_permitido(core, camera, nome_propriedade, valor):
         valor = max(minimo, min(maximo, valor))
 
     return valor
+
+
+def _sair_do_zero_se_preciso(core, camera, nome_propriedade, valor_atual):
+    """O ajuste em calibrar_balanco_de_branco é multiplicativo (valor * (1 +
+    taxa*erro)): se valor_atual for exatamente 0, a correção fica travada em
+    0 pra sempre, não importa o erro (0 vezes qualquer coisa é 0). Dá um
+    empurrão pequeno (1% do limite superior da propriedade) pra sair do
+    zero nesse caso; dali em diante o ajuste multiplicativo normal assume."""
+
+    if valor_atual != 0:
+        return valor_atual
+
+    if core.has_property_limits(camera, nome_propriedade):
+        return core.get_property_upper_limit(camera, nome_propriedade) * 0.01
+
+    return 1.0
 
 
 def calibrar_balanco_de_branco(core, camera):
@@ -87,6 +103,9 @@ def calibrar_balanco_de_branco(core, camera):
 
         valor_r_atual = float(core.get_property(camera, "WhiteBalanceRed"))
         valor_b_atual = float(core.get_property(camera, "WhiteBalanceBlue"))
+
+        valor_r_atual = _sair_do_zero_se_preciso(core, camera, "WhiteBalanceRed", valor_r_atual)
+        valor_b_atual = _sair_do_zero_se_preciso(core, camera, "WhiteBalanceBlue", valor_b_atual)
 
         novo_r = valor_r_atual * (1 + TAXA_APRENDIZADO * erro_r)
         novo_b = valor_b_atual * (1 + TAXA_APRENDIZADO * erro_b)

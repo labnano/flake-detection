@@ -3,7 +3,10 @@ compartilhadas entre deteccao.py e varredura_mosaico.py."""
 
 import math
 
+import cv2
 import numpy as np
+
+from capturar_imagem import capturar_imagem
 
 
 def calibrar_plano_foco(pontos):
@@ -238,3 +241,45 @@ def gerar_malha_varredura(core, xy_stage, fov_x, fov_y):
         "qtd_passos_x": qtd_passos_x,
         "qtd_passos_y": qtd_passos_y,
     }
+
+
+def medir_nitidez(imagem):
+    """Mede o quão nítida (em foco) uma imagem está, usando a variância do
+    Laplaciano -- quanto maior o valor, mais nítida a imagem está.
+    É a métrica clássica de autofoco por imagem em microscopia."""
+
+    cinza = cv2.cvtColor(imagem, cv2.COLOR_RGB2GRAY) if imagem.ndim == 3 else imagem
+    return cv2.Laplacian(cinza, cv2.CV_64F).var()
+
+
+def autofocar(core, z_stage, camera, z_estimado, faixa_um, passo_um):
+    """Faz uma pequena varredura fina em Z ao redor de z_estimado (o Z que o
+    modelo de foco previu) e fica com a posição mais nítida encontrada,
+    varrendo +-faixa_um em passos de passo_um.
+
+    Retorna o Z escolhido e a imagem já capturada nele, pra não precisar
+    tirar outra foto depois."""
+
+    melhor_z = z_estimado
+    melhor_nitidez = -1.0
+    melhor_imagem = None
+
+    for delta in np.arange(-faixa_um, faixa_um + passo_um, passo_um):
+        z_teste = z_estimado + delta
+
+        core.set_position(z_stage, z_teste)
+        core.wait_for_device(z_stage)
+
+        imagem = capturar_imagem(core, camera)
+        nitidez = medir_nitidez(imagem)
+
+        if nitidez > melhor_nitidez:
+            melhor_nitidez = nitidez
+            melhor_z = z_teste
+            melhor_imagem = imagem
+
+    # Deixa o estágio de fato parado na melhor posição encontrada.
+    core.set_position(z_stage, melhor_z)
+    core.wait_for_device(z_stage)
+
+    return melhor_z, melhor_imagem

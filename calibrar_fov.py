@@ -29,7 +29,7 @@ from capturar_imagem import capturar_imagem
  impressa pelo script -- se estiver baixa, ou aumente esse valor (imagem
  de baixa magnificação/FOV grande) ou procure uma área com mais textura.
 """
-DESLOCAMENTO_TESTE_UM = 100.0 #para magnificações menores, escolher tamanho também menores
+DESLOCAMENTO_TESTE_UM = 10.0 #para magnificações menores, escolher tamanho também menores
 
 # Quantas vezes repetir a medição em cada eixo, pra tirar a média
 REPETICOES = 5

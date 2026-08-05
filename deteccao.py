@@ -1,7 +1,7 @@
 import os
 import numpy as np
-import cv2
-from tifffile import imwrite
+import sys
+from tifffile import imwrite, imread
 from pycromanager import Core
 import datetime
 import csv
@@ -20,77 +20,34 @@ from comandos import (
     calcular_z,
     coletar_pontos_calibracao,
     gerar_malha_varredura,
+    autofocar,
 )
 
 predictor = obter_predictor()
 
 # --- CONFIGURAÇÕES DE DIRETÓRIO ---
 timestamp = datetime.datetime.now().strftime('%d-%m-%Y_%H-%M-%S')
-diretorio_saida = os.path.join(DIRETORIO_SAIDA_BASE, "Varredura_" + timestamp)
-diretorio_conferencia = os.path.join(diretorio_saida, "_conferencia")
+diretorio_saida = os.path.join(DIRETORIO_SAIDA_BASE, "Deteccao_" + timestamp)
+diretorio_saida_flakes = os.path.join(diretorio_saida, "flakes")
+diretorio_conferencia = os.path.join(diretorio_saida, "conferencia")
 
 os.makedirs(diretorio_saida, exist_ok=True)
 os.makedirs(diretorio_conferencia, exist_ok=True)
+os.makedirs(diretorio_saida_flakes, exist_ok=True)
 
 arquivo_log = os.path.join(diretorio_saida, "coordenadas_flakes_" + timestamp + ".csv")
 
 with open(arquivo_log, mode='w', newline='', encoding='utf-8-sig') as file:
     writer = csv.writer(file, delimiter=';')
-    writer.writerow(["Nome_Arquivo", "X", "Y", "Z", "Qtd_Flakes"])
+    writer.writerow(["Nome_Arquivo", "X", "Y", "Z", "Qtd_Flakes", "caminho"])
 
 # --- CONFIGURAÇÕES DE AUTOFOCO (parte B) ---
 # A cada INTERVALO_AUTOFOCO imagens, em vez de confiar só no modelo de
 # foco (plano/superfície), o script tira um pequeno "stack" de fotos em
 # Z ao redor do valor previsto e fica com a mais nítida.
-INTERVALO_AUTOFOCO = 20
-AUTOFOCO_FAIXA_UM = 3.0   # quantos µm pra cada lado do Z previsto ele varre
+INTERVALO_AUTOFOCO = 15
+AUTOFOCO_FAIXA_UM = 5.0   # quantos µm pra cada lado do Z previsto ele varre
 AUTOFOCO_PASSO_UM = 0.5   # espaçamento entre as fotos do stack
-
-
-# --- CÁLCULOS ---
-def medir_nitidez(imagem):
-    """
-    Mede o quão nítida (em foco) uma imagem está, usando a variância do
-    Laplaciano -- quanto maior o valor, mais nítida a imagem está.
-    É a métrica clássica de autofoco por imagem em microscopia.
-    """
-
-    cinza = cv2.cvtColor(imagem, cv2.COLOR_RGB2GRAY) if imagem.ndim == 3 else imagem
-    return cv2.Laplacian(cinza, cv2.CV_64F).var()
-
-
-def autofocar(core, z_stage, camera, z_estimado):
-    """
-    Faz uma pequena varredura fina em Z ao redor de z_estimado (o Z que o
-    modelo de foco previu) e fica com a posição mais nítida encontrada.
-
-    Retorna o Z escolhido e a imagem já capturada nele, pra não precisar
-    tirar outra foto depois.
-    """
-
-    melhor_z = z_estimado
-    melhor_nitidez = -1.0
-    melhor_imagem = None
-
-    for delta in np.arange(-AUTOFOCO_FAIXA_UM, AUTOFOCO_FAIXA_UM + AUTOFOCO_PASSO_UM, AUTOFOCO_PASSO_UM):
-        z_teste = z_estimado + delta
-
-        core.set_position(z_stage, z_teste)
-        core.wait_for_device(z_stage)
-
-        imagem = capturar_imagem(core, camera)
-        nitidez = medir_nitidez(imagem)
-
-        if nitidez > melhor_nitidez:
-            melhor_nitidez = nitidez
-            melhor_z = z_teste
-            melhor_imagem = imagem
-
-    # Deixa o estágio de fato parado na melhor posição encontrada.
-    core.set_position(z_stage, melhor_z)
-    core.wait_for_device(z_stage)
-
-    return melhor_z, melhor_imagem
 
 
 core = Core()
@@ -190,10 +147,12 @@ try:
             core.set_xy_position(xy_stage, n, m)
             core.wait_for_device(xy_stage)
 
-            if contador_imagem % INTERVALO_AUTOFOCO == 0:
+            if contador_imagem % INTERVALO_AUTOFOCO == 0 or j == 0:
                 # 3-4. A cada {INTERVALO_AUTOFOCO} imagens, refina o foco:
                 # Tira um pequeno stack em Z e fica com a mais nítida.
-                z_calculado, imagem_colorida = autofocar(core, z_stage, camera, z_previsto)
+                z_calculado, imagem_colorida = autofocar(
+                    core, z_stage, camera, z_previsto, AUTOFOCO_FAIXA_UM, AUTOFOCO_PASSO_UM
+                )
 
                 # A diferença entre o Z realmente mais nítido e o que o
                 # modelo (sem ajuste) previa vira o novo ajuste, e passa a
@@ -213,7 +172,7 @@ try:
                 imagem_colorida = capturar_imagem(core, camera)
                 z_calculado = z_previsto
 
-            if i % 20 == 0 and j % 20 == 0:
+            if j % 20 == 0:
                 nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
                 caminho_completo = os.path.join(diretorio_conferencia, nome_arquivo)
 
@@ -224,28 +183,34 @@ try:
 
             # 6. Detecção
             # O MaskTerial espera BGR (ver FlakeClass.py), então convertemos
-            # antes de mandar pro modelo.
-            flakes = predictor.predict(imagem_colorida[:, :, ::-1])
+            # antes de mandar pro modelo. ascontiguousarray é necessário porque
+            # a inversão de canais [:, :, ::-1] gera um array com stride
+            # negativo, que o torch.tensor() usado dentro do MaskTerial não
+            # aceita (ValueError: "tensors with negative strides").
+            imagem_bgr = np.ascontiguousarray(imagem_colorida[:, :, ::-1])
+            flakes = predictor.predict(imagem_bgr)
 
             if flakes:
                 nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
-                caminho_completo = os.path.join(diretorio_saida, nome_arquivo)
+                caminho_completo = os.path.join(diretorio_saida_flakes, nome_arquivo)
+                caminho_incompleto = os.path.join(diretorio_saida, nome_arquivo)
 
                 nome_arquivo_flakes = f"flakes_pos_X{i}_Y{j}.tif"
-                caminho_completo_flakes = os.path.join(diretorio_saida, nome_arquivo_flakes)
+                caminho_completo_flakes = os.path.join(diretorio_saida_flakes, nome_arquivo_flakes)
 
                 # Salva imagem original
                 imwrite(caminho_completo, imagem_colorida)
+                imwrite(caminho_incompleto, imagem_colorida)
 
                 # Salva imagem com flakes marcados.
                 # display_results também espera BGR (mesmo motivo do predict acima).
-                imagem_flakes = display_results(imagem_colorida[:, :, ::-1], flakes)
+                imagem_flakes = display_results(imagem_bgr, flakes)
                 imwrite(caminho_completo_flakes, imagem_flakes[:, :, ::-1])
 
                 # Registra no CSV
                 with open(arquivo_log, mode='a', newline='', encoding='utf-8-sig') as file:
                     writer = csv.writer(file, delimiter=';')
-                    writer.writerow([nome_arquivo, n, m, z_calculado, len(flakes)])
+                    writer.writerow([nome_arquivo, n, m, z_calculado, len(flakes), f"{diretorio_saida_flakes}"])
 
                 print(
                     f"SUCESSO: {len(flakes)} flake(s) em "
@@ -255,8 +220,49 @@ try:
 
             else:
                 print(f"Sem flakes em X={n:.1f}, Y={m:.1f}, Z={z_calculado:.3f}.")
+                nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
+                caminho_completo = os.path.join(diretorio_saida, nome_arquivo)
+                imwrite(caminho_completo, imagem_colorida)
 
     print("\nVarredura totalmente concluída.")
+
+
+    GRID_X = len(malha_x)  # Número de posições no eixo X
+    GRID_Y = len(malha_y) # Número de posições no eixo Y
+
+    print("Iniciando montagem do mosaico...")
+
+    linhas_do_mosaico = []
+
+    # 1. Monta o mosaico linha por linha (Eixo Y)
+    for j in range(GRID_Y):
+        imagens_da_linha = []
+        
+        # 2. Pega todas as colunas daquela linha (Eixo X)
+        for i in range(GRID_X):
+            nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
+            caminho = os.path.join(diretorio_saida, nome_arquivo)
+            
+            try:
+                # Lê a imagem do disco
+                img = imread(caminho)
+                imagens_da_linha.append(img)
+            except FileNotFoundError:
+                print(f"ERRO: Arquivo {caminho} não encontrado!")
+                sys.exit()
+                
+        # 3. Gruda as imagens horizontalmente (lado a lado)
+        linha_montada = np.hstack(imagens_da_linha)
+        linhas_do_mosaico.append(linha_montada)
+
+    # 4. Gruda todas as linhas verticalmente (uma em cima da outra)
+    mosaico_final = np.vstack(linhas_do_mosaico)
+
+    # 5. Salva o super arquivo final
+    caminho_salvamento = os.path.join(diretorio_saida, f"mosaico_final_{timestamp}.tif")
+    imwrite(caminho_salvamento, mosaico_final)
+
+    print(f"Sucesso! Mosaico salvo com dimensões: {mosaico_final.shape}")
 
 finally:
     # 7. Retorno à origem, sempre executado (mesmo se algo tiver falhado acima).

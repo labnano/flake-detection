@@ -10,18 +10,21 @@ isso cada uma tem o seu próprio campo de visão e a sua própria exposição.
 """
 
 # --- CAMPO DE VISÃO, em µm (vem de calibrar_fov.py) ---
-FOV_DETECCAO = (93.3, 93.3)     # objetiva usada em deteccao.py
+FOV_DETECCAO = (93.0, 93.0)     # objetiva usada em deteccao.py
 FOV_MOSAICO = (933.0, 933.0)    # objetiva usada em varredura_mosaico.py
 
 # --- EXPOSIÇÃO, em ms (vem de calibrar_camera.py) ---
-EXPOSICAO_DETECCAO = 20.0
+EXPOSICAO_DETECCAO = 25.0
 EXPOSICAO_MOSAICO = 3.0
 
 # --- BALANÇO DE BRANCO (vem de calibrar_camera.py) ---
-WHITE_BALANCE_RED = 400
-WHITE_BALANCE_BLUE = 240
+WHITE_BALANCE_RED = 88
+WHITE_BALANCE_BLUE = 163
 
 # --- LIMIARES DE DETECÇÃO do MaskTerial (usados em modelo.py) ---
-SCORE_THRESHOLD = 0.0005
-MIN_CLASS_OCCUPANCY = 0.00025
+SCORE_THRESHOLD = 0.05
+MIN_CLASS_OCCUPANCY = 0.025
 SIZE_THRESHOLD = 50
+
+# --- SCORE MINIMO PARA FOCO ---
+SCORE_FOCO = 1
