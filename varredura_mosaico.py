@@ -7,7 +7,20 @@ import datetime
 from caminhos import DIRETORIO_SAIDA_BASE
 from parametros import FOV_MOSAICO, EXPOSICAO_MOSAICO
 from capturar_imagem import capturar_imagem
-from comandos import calibrar_plano_foco, calcular_z, coletar_pontos_calibracao, gerar_malha_varredura
+from comandos import calibrar_plano_foco, calcular_z, coletar_pontos_calibracao, gerar_malha_varredura, autofocar
+
+# --- CONFIGURAÇÕES DE AUTOFOCO ---
+# A cada INTERVALO_AUTOFOCO imagens, em vez de confiar só no plano de foco
+# (ajustado com o mínimo de 3 pontos), o script tira um pequeno "stack" de
+# fotos em Z ao redor do valor previsto e fica com a mais nítida -- mesma
+# ideia já usada no deteccao.py.
+# Os valores abaixo foram copiados do deteccao.py como ponto de partida --
+# como a objetiva do mosaico tem magnificação diferente (FOV bem maior,
+# ver FOV_MOSAICO), confira/ajuste FAIXA_UM e PASSO_UM pra profundidade de
+# campo real dela antes de rodar uma varredura grande.
+INTERVALO_AUTOFOCO = 20
+AUTOFOCO_FAIXA_UM = 3.0   # quantos µm pra cada lado do Z previsto ele varre
+AUTOFOCO_PASSO_UM = 0.5   # espaçamento entre as fotos do stack
 
 
 # --- CONFIGURAÇÕES DE DIRETÓRIO ---
@@ -64,22 +77,51 @@ core.set_exposure(EXPOSICAO_MOSAICO)
 # O laço inteiro fica dentro de um try/finally: se der erro no meio da
 # varredura (posição inválida, câmera travou, etc.), o estágio ainda assim
 # volta para a posição inicial, em vez de ficar parado onde quebrou.
+contador_imagem = 0
+ajuste_z = 0.0  # correção aprendida pelo autofoco
+
 try:
     for i, n in enumerate(malha_x):
         for j, m in enumerate(malha_y):
-            # 1. Movimentação
+            contador_imagem += 1
+
+            # 1. Movimentação XY
             core.set_xy_position(xy_stage, n, m)
             core.wait_for_device(xy_stage)
-            core.set_position(z_stage, calcular_z(n, m, modelo_foco))
-            core.wait_for_device(z_stage)
-            # 2. Captura dos dados brutos, já organizados em RGB
-            imagem_colorida = capturar_imagem(core, camera)
 
-            # 5. Define o nome do arquivo dinamicamente
+            z_previsto = calcular_z(n, m, modelo_foco) + ajuste_z
+
+            if contador_imagem % INTERVALO_AUTOFOCO == 0:
+                # 2-3. A cada INTERVALO_AUTOFOCO imagens, refina o foco:
+                # tira um pequeno stack em Z ao redor do previsto e fica
+                # com a mais nítida, corrigindo o que o plano de foco
+                # (calibrado com só 3 pontos) não capturou.
+                z_calculado, imagem_colorida = autofocar(
+                    core, z_stage, camera, z_previsto, AUTOFOCO_FAIXA_UM, AUTOFOCO_PASSO_UM
+                )
+
+                # A diferença entre o Z realmente mais nítido e o que o
+                # modelo (sem ajuste) previa vira o novo ajuste, e passa a
+                # valer para as próximas posições, até o próximo checkpoint.
+                ajuste_z = z_calculado - calcular_z(n, m, modelo_foco)
+
+                print(
+                    f"[Autofoco] Z ajustado para {z_calculado:.3f} "
+                    f"(ajuste acumulado: {ajuste_z:+.3f})"
+                )
+            else:
+                # 2. Movimentação Z direto pro valor previsto
+                core.set_position(z_stage, z_previsto)
+                core.wait_for_device(z_stage)
+
+                # 3. Captura dos dados brutos, já organizados em RGB
+                imagem_colorida = capturar_imagem(core, camera)
+
+            # 4. Define o nome do arquivo dinamicamente
             nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
             caminho_completo = os.path.join(diretorio_saida, nome_arquivo)
 
-            # 6. Salva a matriz no formato nativo, sem corromper os bits
+            # 5. Salva a matriz no formato nativo, sem corromper os bits
             imwrite(caminho_completo, imagem_colorida)
             print(f"Salvo: {nome_arquivo}")
 
