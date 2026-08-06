@@ -20,7 +20,7 @@ from modelo import obter_predictor, display_results
 def main(pasta):
     predictor = obter_predictor()
 
-    caminhos = glob.glob(os.path.join(pasta, "*.tif"))
+    caminhos = glob.glob(os.path.join(pasta, "**", "*.tif"), recursive=True)
 
     if not caminhos:
         print(f"Nenhuma imagem .tif encontrada em: {pasta}")
@@ -29,7 +29,7 @@ def main(pasta):
     for caminho in caminhos:
         imagem = cv2.imread(caminho)
         print(f"\nTestando: {caminho}")
-
+        #imagem_rgb = cv2.cvtColor(imagem, cv2.COLOR_BGR2RGB)
         flakes = predictor.predict(imagem)
 
         if flakes:
