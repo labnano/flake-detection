@@ -1,13 +1,18 @@
 import os
-import sys
-import numpy as np
-from tifffile import imwrite, imread
+from tifffile import imwrite
 from pycromanager import Core
 import datetime
 from caminhos import DIRETORIO_SAIDA_BASE
-from parametros import FOV_MOSAICO, EXPOSICAO_MOSAICO
+from parametros import FOV_MOSAICO, EXPOSICAO_MOSAICO, SOBREPOSICAO
 from capturar_imagem import capturar_imagem
-from comandos import calibrar_plano_foco, calcular_z, coletar_pontos_calibracao, gerar_malha_varredura, autofocar
+from comandos import (
+    calibrar_plano_foco,
+    calcular_z,
+    coletar_pontos_calibracao,
+    gerar_malha_varredura,
+    autofocar,
+    salvar_metadados_varredura,
+)
 
 # --- CONFIGURAÇÕES DE AUTOFOCO ---
 # A cada INTERVALO_AUTOFOCO imagens, em vez de confiar só no plano de foco
@@ -37,7 +42,7 @@ z_stage = core.get_focus_device()
 
 fov_x, fov_y = FOV_MOSAICO
 
-malha = gerar_malha_varredura(core, xy_stage, fov_x, fov_y)
+malha = gerar_malha_varredura(core, xy_stage, fov_x, fov_y, SOBREPOSICAO)
 malha_x = malha["malha_x"]
 malha_y = malha["malha_y"]
 x_inicial = malha["x_inicial"]
@@ -46,6 +51,8 @@ dist_x = malha["dist_x"]
 dist_y = malha["dist_y"]
 qtd_passos_x = malha["qtd_passos_x"]
 qtd_passos_y = malha["qtd_passos_y"]
+
+salvar_metadados_varredura(diretorio_saida, malha, fov_x, fov_y)
 
 minimo_pontos = 3
 pontos_coletados = coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos)
@@ -96,19 +103,28 @@ try:
                 # tira um pequeno stack em Z ao redor do previsto e fica
                 # com a mais nítida, corrigindo o que o plano de foco
                 # (calibrado com só 3 pontos) não capturou.
-                z_calculado, imagem_colorida = autofocar(
+                z_calculado, imagem_colorida, confiavel = autofocar(
                     core, z_stage, camera, z_previsto, AUTOFOCO_FAIXA_UM, AUTOFOCO_PASSO_UM
                 )
 
-                # A diferença entre o Z realmente mais nítido e o que o
-                # modelo (sem ajuste) previa vira o novo ajuste, e passa a
-                # valer para as próximas posições, até o próximo checkpoint.
-                ajuste_z = z_calculado - calcular_z(n, m, modelo_foco)
+                if confiavel:
+                    # A diferença entre o Z realmente mais nítido e o que o
+                    # modelo (sem ajuste) previa vira o novo ajuste, e passa a
+                    # valer para as próximas posições, até o próximo checkpoint.
+                    ajuste_z = z_calculado - calcular_z(n, m, modelo_foco)
 
-                print(
-                    f"[Autofoco] Z ajustado para {z_calculado:.3f} "
-                    f"(ajuste acumulado: {ajuste_z:+.3f})"
-                )
+                    print(
+                        f"[Autofoco] Z ajustado para {z_calculado:.3f} "
+                        f"(ajuste acumulado: {ajuste_z:+.3f})"
+                    )
+                else:
+                    # Melhor Z na ponta da faixa: o foco real está fora do
+                    # alcance da busca. Aceitar esse valor como ajuste
+                    # estragaria todas as posições seguintes.
+                    print(
+                        f"[Autofoco] descartado: melhor Z na borda da faixa "
+                        f"(+-{AUTOFOCO_FAIXA_UM} µm)."
+                    )
             else:
                 # 2. Movimentação Z direto pro valor previsto
                 core.set_position(z_stage, z_previsto)
@@ -133,39 +149,17 @@ finally:
     core.set_xy_position(xy_stage, x_inicial, y_inicial)
     core.wait_for_device(xy_stage)
 
-GRID_X = len(malha_x)  # Número de posições no eixo X
-GRID_Y = len(malha_y) # Número de posições no eixo Y
-
-print("Iniciando montagem do mosaico...")
-
-linhas_do_mosaico = []
-
-# 1. Monta o mosaico linha por linha (Eixo Y)
-for j in range(GRID_Y):
-    imagens_da_linha = []
-    
-    # 2. Pega todas as colunas daquela linha (Eixo X)
-    for i in range(GRID_X):
-        nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
-        caminho = os.path.join(diretorio_saida, nome_arquivo)
-        
-        try:
-            # Lê a imagem do disco
-            img = imread(caminho)
-            imagens_da_linha.append(img)
-        except FileNotFoundError:
-            print(f"ERRO: Arquivo {caminho} não encontrado!")
-            sys.exit()
-            
-    # 3. Gruda as imagens horizontalmente (lado a lado)
-    linha_montada = np.hstack(imagens_da_linha)
-    linhas_do_mosaico.append(linha_montada)
-
-# 4. Gruda todas as linhas verticalmente (uma em cima da outra)
-mosaico_final = np.vstack(linhas_do_mosaico)
-
-# 5. Salva o super arquivo final
-caminho_salvamento = os.path.join(diretorio_saida, f"mosaico_final_{timestamp}.tif")
-imwrite(caminho_salvamento, mosaico_final)
-
-print(f"Sucesso! Mosaico salvo com dimensões: {mosaico_final.shape}")
+# A montagem do mosaico ficou no montar_mosaico.py, por dois motivos.
+#
+# O primeiro é memória: empilhar a varredura inteira com hstack/vstack exige
+# o mosaico todo na RAM de uma vez, e uma falha aqui jogaria fora horas de
+# microscópio. O montar_mosaico.py grava direto em disco (memmap) e, por ser
+# um script à parte, pode ser repetido sem repetir a varredura.
+#
+# O segundo é correção: com SOBREPOSICAO > 0 os tiles NÃO são adjacentes, e
+# colá-los lado a lado duplicaria a faixa compartilhada, esticando o mosaico.
+# O montar_mosaico.py lê o varredura.json gravado acima e recorta cada tile
+# ao passo real antes de encaixar.
+print(f"\nImagens da grade completa em: {diretorio_saida}")
+print("Para montar o mosaico, rode:")
+print(f'    python montar_mosaico.py "{diretorio_saida}"')
