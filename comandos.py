@@ -16,13 +16,80 @@ from capturar_imagem import capturar_imagem
 # erro dos pontos de calibração no resultado: com cond = 1e6, um erro
 # humano de 0,4 µm ao focar um ponto vira até 4e5 µm no Z previsto.
 #
-# Isso não é hipotético. Seis pontos onde quatro são os cantos de um
-# retângulo dão cond ~1e7 no ajuste quadrático (nos quatro cantos, dx² e
-# dy² valem o mesmo, então essas colunas ficam quase constantes e quase
-# dependentes da coluna de 1s). Um teste de posto NÃO pega isso: o posto
-# dá 6, cheio, e o ajuste passa devolvendo lixo. Com 8+ pontos bem
-# espalhados o cond fica na casa das dezenas.
+# O que estraga o condicionamento é a falta de NÍVEIS -- a quantidade de
+# valores distintos que cada coordenada assume no conjunto de pontos --, e
+# não a regularidade do arranjo. Para estimar grau d num eixo são precisos
+# d+1 níveis nesse eixo: o plano (grau 1) exige 2, a quadrática (grau 2)
+# exige 3. O motivo é direto: com só 2 níveis, ux² pode ser interpolado
+# exatamente por uma reta em ux, então a coluna ux² vira combinação linear
+# das colunas ux e 1s e a matriz fica SINGULAR -- não apenas mal
+# condicionada. É o caso dos quatro cantos de um retângulo (2 níveis em
+# cada eixo) e o de um grid 5x2 (2 níveis em Y): ambos medem cond ~1e16.
+#
+# Um teste de posto não substitui esta verificação. Ele pega o caso
+# exatamente singular, mas não o "quase", que é o que aparece na prática
+# quando os pontos estão só PERTO de degenerados -- ali o posto dá 6,
+# cheio, e o ajuste passa devolvendo lixo. Para referência: um grid 3x3
+# regular dá cond ~4, e 10 pontos sorteados ao acaso, ~11.
 LIMITE_CONDICIONAMENTO = 1e4
+
+
+def _matriz_projeto(xs, ys, tipo):
+    """Monta a matriz de projeto do ajuste de foco para as coordenadas
+    dadas e devolve (matriz, x0, y0, escala).
+
+    Vive numa função própria porque o condicionamento precisa ser medido
+    em DOIS momentos: no ajuste, com os pontos que o usuário de fato
+    focou, e ANTES da coleta, só com as coordenadas sugeridas -- é isso
+    que permite avisar sobre uma geometria ruim enquanto ainda dá tempo de
+    mudar, em vez de recusar tudo depois de dez focagens manuais. Como o
+    condicionamento não depende de Z, os dois cálculos são o mesmo; se
+    cada lugar montasse a sua própria matriz, o aviso prévio e a recusa
+    final poderiam discordar."""
+
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+
+    x0 = float(np.mean(xs))
+    y0 = float(np.mean(ys))
+
+    dx = xs - x0
+    dy = ys - y0
+
+    if tipo != "quadratica":
+        # O plano ajusta dz (também centrado) contra dx e dy, por isso não
+        # há coluna de 1s aqui: o z0 já é a média dos Z.
+        return np.column_stack([dx, dy]), x0, y0, 1.0
+
+    # Normaliza as coordenadas ANTES de montar a matriz, para que as
+    # colunas fiquem na mesma ordem de grandeza: sem isso, numa área de
+    # ~500 µm, dx fica nas centenas e dx² nas centenas de milhares. Isso
+    # melhora o condicionamento cerca de 25x (medido: 2,5e8 -> 9,8e6).
+    # Sozinho NÃO resolve: o que domina é a geometria dos pontos, não a
+    # escala das unidades -- ver LIMITE_CONDICIONAMENTO.
+    escala = float(max(np.abs(dx).max(), np.abs(dy).max()))
+
+    if escala == 0:
+        raise ValueError(
+            "ERRO: todos os pontos de calibração estão na mesma posição XY."
+        )
+
+    ux = dx / escala
+    uy = dy / escala
+
+    matriz = np.column_stack([ux, uy, ux * uy, ux**2, uy**2, np.ones(len(xs))])
+
+    return matriz, x0, y0, escala
+
+
+def _condicionamento(xs, ys, tipo):
+    """Fator de amplificação do erro de foco para uma dada geometria de
+    pontos. Depende só de X e Y -- é por isso que dá para avaliar a
+    qualidade de um conjunto de pontos antes de focar qualquer um deles."""
+
+    matriz, _, _, _ = _matriz_projeto(xs, ys, tipo)
+
+    return float(np.linalg.cond(matriz))
 
 
 def calibrar_plano_foco(pontos, verboso=True):
@@ -35,25 +102,21 @@ def calibrar_plano_foco(pontos, verboso=True):
 
     pontos = np.array(pontos, dtype=float)
 
-    xs = pontos[:, 0]
-    ys = pontos[:, 1]
-    zs = pontos[:, 2]
-
-    # Centro dos pontos de calibração
-    x0 = np.mean(xs)
-    y0 = np.mean(ys)
-    z0 = np.mean(zs)
-
-    dx = xs - x0
-    dy = ys - y0
-    dz = zs - z0
-
     if len(pontos) < 3:
         raise ValueError(
             "ERRO: São necessários pelo menos 3 pontos para ajustar o plano de foco."
         )
 
-    matriz = np.column_stack([dx, dy])
+    xs = pontos[:, 0]
+    ys = pontos[:, 1]
+    zs = pontos[:, 2]
+
+    matriz, x0, y0, _ = _matriz_projeto(xs, ys, "plano")
+
+    # Centro em Z dos pontos de calibração. O ajuste é feito sobre dz,
+    # centrado, e por isso a matriz do plano não tem coluna de 1s.
+    z0 = float(np.mean(zs))
+    dz = zs - z0
 
     # Pontos alinhados (ou quase) deixam o plano mal determinado. O número
     # de condição pega tanto o caso exato quanto o "quase", que é o que
@@ -101,33 +164,6 @@ def calibrar_superficie_foco(pontos, verboso=True):
 
     pontos = np.array(pontos, dtype=float)
 
-    xs = pontos[:, 0]
-    ys = pontos[:, 1]
-    zs = pontos[:, 2]
-
-    x0 = np.mean(xs)
-    y0 = np.mean(ys)
-
-    dx = xs - x0
-    dy = ys - y0
-
-    # Normaliza as coordenadas ANTES de montar a matriz de projeto, para
-    # que as colunas fiquem na mesma ordem de grandeza: sem isso, numa área
-    # de ~500 µm, dx fica nas centenas e dx² nas centenas de milhares.
-    # Isso melhora o condicionamento cerca de 25x (medido: 2,5e8 -> 9,8e6).
-    # Sozinho NÃO resolve: o que domina o condicionamento é a geometria dos
-    # pontos, não a escala das unidades -- ver LIMITE_CONDICIONAMENTO e a
-    # verificação logo abaixo.
-    escala = float(max(np.abs(dx).max(), np.abs(dy).max()))
-
-    if escala == 0:
-        raise ValueError(
-            "ERRO: todos os pontos de calibração estão na mesma posição XY."
-        )
-
-    ux = dx / escala
-    uy = dy / escala
-
     if len(pontos) < 6:
         raise ValueError(
             "ERRO: A superfície quadrática tem 6 coeficientes e precisa de pelo "
@@ -136,7 +172,11 @@ def calibrar_superficie_foco(pontos, verboso=True):
             "média para amortecê-lo."
         )
 
-    matriz_teste = np.column_stack([ux, uy, ux * uy, ux**2, uy**2, np.ones(len(pontos))])
+    xs = pontos[:, 0]
+    ys = pontos[:, 1]
+    zs = pontos[:, 2]
+
+    matriz_teste, x0, y0, escala = _matriz_projeto(xs, ys, "quadratica")
 
     condicionamento = np.linalg.cond(matriz_teste)
 
@@ -146,8 +186,10 @@ def calibrar_superficie_foco(pontos, verboso=True):
             f"superfície quadrática (condicionamento {condicionamento:.1e}, "
             f"limite {LIMITE_CONDICIONAMENTO:.0e}). Nesse estado, o erro ao "
             "focar cada ponto seria amplificado por esse fator no Z previsto. "
-            "Use mais pontos e evite colocá-los só nos cantos e no centro -- "
-            "espalhe-os de forma irregular pela área da varredura."
+            "A causa quase sempre é falta de níveis: a quadrática precisa de "
+            "pelo menos 3 valores DISTINTOS de X e 3 de Y entre os pontos. "
+            "Quatro cantos, uma fileira ou uma diagonal não atendem a isso, "
+            "por mais pontos que se acrescente sobre o mesmo padrão."
         )
 
     coeficientes, _, _, _ = np.linalg.lstsq(matriz_teste, zs, rcond=None)
@@ -262,10 +304,182 @@ def _imprimir_modelo_foco(modelo_foco, pontos):
         )
 
 
-def coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos):
-    """Pede a quantidade de pontos de calibração e depois coleta cada um
-    deles movendo o estágio manualmente. Retorna a lista de pontos
-    (X, Y, Z) coletados."""
+def _melhor_grid(qtd, minimo_niveis):
+    """Escolhe (nx, ny): o maior grid com nx*ny <= qtd em que ambos os
+    eixos tenham pelo menos minimo_niveis níveis. Empates são resolvidos
+    pelo arranjo mais próximo de quadrado.
+
+    Por que o maior grid que CABE, e não o menor que cobre: sobra é fácil
+    de resolver -- os pontos excedentes vão para os centros das células e
+    não mexem nos níveis existentes. Falta obrigaria a remover pontos do
+    grid, e remover pode derrubar um nível e tornar a matriz singular,
+    que é exatamente o que se está tentando evitar.
+
+    Devolve None quando nenhum grid cabe. Isso só acontece no plano com 3
+    pontos, já que o menor grid possível ali (2x2) já são 4."""
+
+    melhor = None
+
+    for nx in range(minimo_niveis, qtd + 1):
+        for ny in range(minimo_niveis, qtd + 1):
+            if nx * ny > qtd:
+                continue
+
+            # Critério, nesta ordem: aproveitar o máximo de pontos dentro
+            # do grid e, entre os empates, equilibrar os níveis entre os
+            # eixos. Um 3x7 mediria a curvatura em Y com sete níveis e a
+            # de X com o mínimo de três, gastando pontos à toa.
+            chave = (nx * ny, -abs(nx - ny))
+
+            if melhor is None or chave > melhor[0]:
+                melhor = (chave, (nx, ny))
+
+    if melhor is None:
+        return None
+
+    return melhor[1]
+
+
+def _ordenar_serpentina(pontos):
+    """Reordena os pontos em serpentina -- colunas de X, com o sentido de
+    Y invertido a cada coluna -- para o estágio não atravessar a amostra
+    de ponta a ponta entre um ponto e o seguinte."""
+
+    colunas = {}
+
+    for x, y in pontos:
+        # O arredondamento serve só para agrupar: pontos gerados na mesma
+        # coluna podem diferir no último bit por causa do linspace.
+        colunas.setdefault(round(x, 6), []).append((x, y))
+
+    ordenados = []
+
+    for indice, chave in enumerate(sorted(colunas)):
+        descendo = indice % 2 == 1
+        ordenados.extend(sorted(colunas[chave], key=lambda ponto: ponto[1], reverse=descendo))
+
+    return ordenados
+
+
+def sugerir_pontos_calibracao(malha, qtd, tipo):
+    """Sugere qtd coordenadas (X, Y) bem distribuídas pela área que a
+    varredura vai de fato percorrer.
+
+    A ideia é tirar do usuário a escolha da GEOMETRIA -- onde o erro
+    humano é sistemático e caro, já que os padrões intuitivos (quatro
+    cantos, uma fileira, a diagonal) são justamente os singulares -- e
+    deixar com ele só o que exige o olho no ocular: achar o foco. Como o
+    condicionamento não depende de Z, o arranjo inteiro pode ser conferido
+    aqui, antes de o usuário focar o primeiro ponto.
+
+    Devolve um dicionário com os pontos já na ordem de visita, a descrição
+    do arranjo, o condicionamento previsto e o espaçamento do grid -- este
+    último serve para dizer ao usuário quanto ele pode se afastar de um
+    alvo sem estragar o ajuste."""
+
+    malha_x = malha["malha_x"]
+    malha_y = malha["malha_y"]
+
+    # Extremos da MALHA, e não o ponto inicial/final que o usuário marcou:
+    # o modelo de foco precisa ser bom onde as imagens serão tiradas, e o
+    # arredondamento para cima do número de passos faz a malha extrapolar
+    # um pouco a área marcada. Usar min/max também dispensa saber em que
+    # sentido a varredura corre.
+    x_min, x_max = min(malha_x), max(malha_x)
+    y_min, y_max = min(malha_y), max(malha_y)
+
+    # Varredura de uma coluna (ou de uma linha) só: sem extensão naquele
+    # eixo todos os pontos cairiam no mesmo X, e a matriz seria singular
+    # por falta de níveis. Abre-se a faixa de um passo, que é o pedaço da
+    # amostra que aquele tile de fato cobre.
+    if x_max == x_min:
+        x_min -= malha["passo_x"] / 2
+        x_max += malha["passo_x"] / 2
+
+    if y_max == y_min:
+        y_min -= malha["passo_y"] / 2
+        y_max += malha["passo_y"] / 2
+
+    # Grau 1 precisa de 2 níveis por eixo, grau 2 precisa de 3.
+    # Ver LIMITE_CONDICIONAMENTO.
+    minimo_niveis = 3 if tipo == "quadratica" else 2
+
+    grid = _melhor_grid(qtd, minimo_niveis)
+
+    if grid is None:
+        # Só o plano com 3 pontos chega aqui, e para ele o triângulo largo
+        # é o arranjo ótimo (cond ~1,15 numa área quadrada).
+        pontos = [
+            (x_min, y_min),
+            (x_max, y_min),
+            ((x_min + x_max) / 2, y_max),
+        ]
+        descricao = "triângulo largo"
+        espacamento = min(x_max - x_min, y_max - y_min) / 2
+
+    else:
+        nx, ny = grid
+
+        xs = np.linspace(x_min, x_max, nx)
+        ys = np.linspace(y_min, y_max, ny)
+
+        pontos = [(float(x), float(y)) for x in xs for y in ys]
+        descricao = f"grid {nx}x{ny}"
+
+        faltam = qtd - nx * ny
+
+        if faltam:
+            # Os pontos que sobram vão para os centros das células: eles
+            # acrescentam níveis intermediários em vez de mexer nos que já
+            # existem, então nunca pioram o condicionamento.
+            centros = [
+                (float((xs[i] + xs[i + 1]) / 2), float((ys[j] + ys[j + 1]) / 2), i + j)
+                for i in range(nx - 1)
+                for j in range(ny - 1)
+            ]
+
+            # Ordem de tabuleiro: pegando primeiro as células de paridade
+            # par, os poucos centros usados saem diagonalmente opostos em
+            # vez de amontoados num canto.
+            centros.sort(key=lambda centro: (centro[2] % 2, centro[2]))
+
+            pontos += [(x, y) for x, y, _ in centros[:faltam]]
+            descricao += f" + {faltam} centro(s) de célula"
+
+        espacamento = min((x_max - x_min) / (nx - 1), (y_max - y_min) / (ny - 1))
+
+    pontos = _ordenar_serpentina(pontos)
+
+    return {
+        "pontos": pontos,
+        "descricao": descricao,
+        "condicionamento": _condicionamento(
+            [ponto[0] for ponto in pontos], [ponto[1] for ponto in pontos], tipo
+        ),
+        "espacamento": espacamento,
+    }
+
+
+def coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos, malha=None, tipo="plano"):
+    """Pede a quantidade de pontos de calibração e depois coleta cada um.
+
+    Com malha=None mantém o modo manual: o usuário escolhe sozinho onde
+    colocar cada ponto. Recebendo a malha, o script passa a SUGERIR as
+    posições e a levar o estágio até elas em XY -- ao usuário resta só
+    ajustar o foco.
+
+    O script nunca toca no Z. Antes da calibração ele não sabe onde está a
+    superfície da amostra, e descer a objetiva às cegas arrisca bater
+    nela; a partir de três pontos ele passa a IMPRIMIR uma estimativa de
+    Z, que é informação, não movimento.
+
+    O alvo sugerido é um alvo, não uma obrigação: caindo num pedaço vazio
+    do substrato, o usuário move até onde houver estrutura focável. O que
+    entra na lista é sempre a posição REAL lida do estágio, nunca a
+    sugerida -- gravar a teórica introduziria um erro em X e Y que o
+    ajuste depois interpretaria como variação de foco.
+
+    Retorna a lista de pontos (X, Y, Z) coletados."""
 
     while True:
         entrada = input(f"Quantos pontos serão utilizados para ajustar a varredura? (Mínimo {minimo_pontos}): ")
@@ -286,10 +500,71 @@ def coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos):
         except ValueError:
             print("[Erro] Entrada inválida! Por favor, digite apenas números inteiros. Exemplo: 3, 4, 5.\n")
 
+    sugestao = None
+
+    if malha is not None:
+        sugestao = sugerir_pontos_calibracao(malha, qtd_pontos_calibracao, tipo)
+
+        print(
+            f"Arranjo sugerido: {sugestao['descricao']} -- condicionamento previsto "
+            f"{sugestao['condicionamento']:.1f} (limite {LIMITE_CONDICIONAMENTO:.0e})."
+        )
+
+        if sugestao["condicionamento"] > LIMITE_CONDICIONAMENTO:
+            # Nenhum rearranjo salva este caso: o condicionamento também
+            # depende da razão de aspecto da ÁREA, e uma área muito
+            # alongada estoura o limite mesmo com os pontos ideais.
+            print(
+                "[Aviso] Nem o melhor arranjo possível cabe no limite nesta área --\n"
+                "        ela é alongada demais para o ajuste escolhido. O problema é a\n"
+                "        forma da área, não a posição dos pontos, e mudar os pontos não\n"
+                "        resolve. Considere usar o plano em vez da quadrática, ou varrer\n"
+                "        uma região menos alongada."
+            )
+        elif sugestao["condicionamento"] > LIMITE_CONDICIONAMENTO / 100:
+            print(
+                "[Aviso] Condicionamento previsto alto (área alongada). Passa no limite,\n"
+                "        mas o erro ao focar cada ponto será amplificado no Z previsto."
+            )
+
+        print(
+            f"\nO estágio será levado até cada ponto sugerido. Se algum cair num pedaço\n"
+            f"sem nada em que focar, mova livremente até uma região próxima que tenha\n"
+            f"estrutura: o que vale é onde você parar. Desvios de até uns\n"
+            f"{sugestao['espacamento']:.0f} µm não atrapalham o ajuste."
+        )
+
     pontos_coletados = []
 
     for p in range(qtd_pontos_calibracao):
-        input(f"\nMova o estágio para o Ponto de Calibração {p + 1}, AJUSTE O FOCO, e pressione ENTER...")
+        alvo_x = alvo_y = None
+
+        if sugestao is None:
+            input(f"\nMova o estágio para o Ponto de Calibração {p + 1}, AJUSTE O FOCO, e pressione ENTER...")
+
+        else:
+            alvo_x, alvo_y = sugestao["pontos"][p]
+
+            print(f"\n--- Ponto {p + 1} de {qtd_pontos_calibracao} ---")
+            print(f"Levando o estágio para X={alvo_x:.2f}, Y={alvo_y:.2f}...")
+
+            core.set_xy_position(xy_stage, alvo_x, alvo_y)
+            core.wait_for_device(xy_stage)
+
+            # Com 3 pontos já dá para ajustar um plano provisório e dizer
+            # em que Z o foco provavelmente está. É só um número impresso:
+            # quem move o Z continua sendo o usuário.
+            if len(pontos_coletados) >= 3:
+                modelo_previo = reajustar_modelo_foco(pontos_coletados, "plano")
+
+                if modelo_previo is not None:
+                    print(
+                        f"Z estimado pelos {len(pontos_coletados)} pontos anteriores: "
+                        f"{calcular_z(alvo_x, alvo_y, modelo_previo):.3f} "
+                        f"(estimativa; o script não mexe no Z)"
+                    )
+
+            input("AJUSTE O FOCO e pressione ENTER...")
 
         x_atual = core.get_x_position(xy_stage)
         y_atual = core.get_y_position(xy_stage)
@@ -298,6 +573,31 @@ def coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos):
         pontos_coletados.append((x_atual, y_atual, z_atual))
 
         print(f"-> Ponto {p + 1} salvo: X={x_atual:.1f}, Y={y_atual:.1f}, Z={z_atual:.2f}")
+
+        if alvo_x is not None:
+            desvio = math.hypot(x_atual - alvo_x, y_atual - alvo_y)
+
+            if desvio > sugestao["espacamento"]:
+                print(
+                    f"   [Aviso] desvio de {desvio:.0f} µm do alvo, maior que o espaçamento "
+                    f"do arranjo ({sugestao['espacamento']:.0f} µm). Registrado assim mesmo; "
+                    "a conferência abaixo dirá se a geometria ainda serve."
+                )
+
+    if sugestao is not None:
+        # O condicionamento previsto valia para os alvos. Este é o dos
+        # pontos que o usuário de fato focou -- é ele que vale, e vê-lo
+        # aqui evita descobrir um problema só quando o ajuste recusar.
+        condicionamento = _condicionamento(
+            [ponto[0] for ponto in pontos_coletados],
+            [ponto[1] for ponto in pontos_coletados],
+            tipo,
+        )
+
+        print(
+            f"\nCondicionamento dos pontos realmente coletados: {condicionamento:.1f} "
+            f"(previsto: {sugestao['condicionamento']:.1f}, limite {LIMITE_CONDICIONAMENTO:.0e})."
+        )
 
     return pontos_coletados
 

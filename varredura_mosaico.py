@@ -55,7 +55,13 @@ qtd_passos_y = malha["qtd_passos_y"]
 salvar_metadados_varredura(diretorio_saida, malha, fov_x, fov_y)
 
 minimo_pontos = 3
-pontos_coletados = coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos)
+
+# A malha vai junto porque é dela que saem as posições sugeridas: os pontos
+# de calibração precisam cobrir a área que a varredura vai percorrer, não
+# uma região qualquer da amostra. Aqui o modelo é sempre o plano.
+pontos_coletados = coletar_pontos_calibracao(
+    core, xy_stage, z_stage, minimo_pontos, malha=malha, tipo="plano"
+)
 
 modelo_foco = calibrar_plano_foco(pontos_coletados)
 print("\n[Sucesso] Plano de foco calculado!")

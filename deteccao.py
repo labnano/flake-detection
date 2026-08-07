@@ -97,15 +97,16 @@ salvar_metadados_varredura(diretorio_saida, malha, fov_x, fov_y)
 print("\n--- MÉTODO DE CALIBRAÇÃO DE FOCO ---")
 print("1. Plano (mais rápido, funciona bem se a amostra for praticamente plana)")
 print("2. Superfície curva/quadrática (mais precisa com lentes de magnificações maiores, porém exige mais pontos)")
-print("   Dica: espalhe os pontos de forma IRREGULAR pela área. Colocá-los")
-print("   só nos cantos e no centro é uma configuração degenerada e o ajuste")
-print("   será recusado.")
+print("   Onde colocar os pontos não é mais escolha sua: o script calcula as")
+print("   posições que dão o melhor ajuste e leva o estágio até cada uma.")
+print("   Você só precisa focar (ou chegar perto, se ali não houver estrutura).")
 
 while True:
     metodo = input("Escolha o método (1 ou 2): ").strip()
 
     if metodo == "1":
         minimo_pontos = 3
+        tipo_modelo = "plano"
         break
     elif metodo == "2":
         # A quadrática tem 6 coeficientes, então 6 pontos é o mínimo
@@ -114,13 +115,19 @@ while True:
         # amortecer. Medido: com 8 pontos o erro máximo ainda fica em ~2 µm;
         # com 10 cai para ~0,9 µm; com 12, ~0,65 µm. Daí o mínimo de 10.
         minimo_pontos = 10
+        tipo_modelo = "quadratica"
         break
     else:
         print("[Erro] Digite 1 ou 2.\n")
 
 print(f"Esse método precisa de pelo menos {minimo_pontos} pontos de calibração.\n")
 
-pontos_coletados = coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos)
+# A malha vai junto porque é dela que saem as posições sugeridas: os pontos
+# de calibração precisam cobrir a área que a varredura vai percorrer, não
+# uma região qualquer da amostra.
+pontos_coletados = coletar_pontos_calibracao(
+    core, xy_stage, z_stage, minimo_pontos, malha=malha, tipo=tipo_modelo
+)
 
 
 if metodo == "1":
