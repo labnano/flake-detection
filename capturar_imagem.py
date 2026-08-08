@@ -17,7 +17,7 @@ def capturar_imagem(core, camera):
 
     try:
         imagem_bgra = pixels_brutos.reshape((altura, largura, 4))
-        imagem = np.ascontiguousarray(imagem_bgra[:, :, :3][:, :, ::-1])
+        imagem = np.ascontiguousarray(imagem_bgra[:, :, :3][:, :, ::-1]) #imagem em RGB
     except ValueError:
         # Câmera não devolveu 4 canais (ex: modo monocromático).
         bytes_por_pixel = core.get_bytes_per_pixel()

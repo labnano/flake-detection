@@ -5,8 +5,12 @@
 __pycache__/
 *.pyc
 
-# Pesos do modelo (325MB+301MB, excedem o limite do GitHub -- baixar separadamente)
+# Pesos do modelo (
 modelo/
 
-# Configuração local da IDE (PyCharm)
+# Configuração local da IDE
 .idea/
+
+analisar_foco_razao.py
+testar_calibracao_foco.py
+NOTAS_REVISAO.md

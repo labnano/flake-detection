@@ -1,10 +1,11 @@
+"""Procura nomes de parâmetros importantes da camera e seus respectivos valores"""
+
 from pycromanager import Core
 
 core = Core()
 camera = core.get_camera_device()
 
 print("Câmera ativa:", camera)
-
 
 def str_vector_para_lista(vetor):
     """

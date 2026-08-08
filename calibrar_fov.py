@@ -9,7 +9,7 @@ para medir quantos pixels a imagem se deslocou entre as duas fotos. Daí:
     µm/pixel = distância_movida / deslocamento_medido_em_pixels
     FOV = tamanho_da_imagem_em_pixels * µm/pixel
 
-Qualquer área com um pouco de textura/contraste serve (poeira, risco no substrato,
+Qualquer área com um POUCO de textura/contraste serve (poeira, risco no substrato,
 borda de um flake, etc.);
 """
 
@@ -25,32 +25,34 @@ from capturar_imagem import capturar_imagem
 # bastante para funcionar em qualquer objetiva sem perder a sobreposição.
 DESLOCAMENTO_INICIAL_UM = 10.0
 
-# Deslocamento da medição FINAL, como fração da largura/altura da imagem.
-# Por que medir de novo com outro valor, em vez de usar um número fixo:
-# a precisão relativa melhora com o tamanho do deslocamento. Dois erros
-# competem aqui --
-#   - o erro do próprio estágio (ex: ±0,1 µm) é ABSOLUTO: num comando de
-#     10 µm ele vale 1%, num de 100 µm vale 0,1%;
-#   - o erro da correlação de fase (~0,03 px) também é absoluto em pixels.
-# Ambos encolhem, em termos relativos, quanto maior o deslocamento. O
-# limite é a sobreposição entre as duas fotos: medido em simulação, a
-# partir de ~50% da largura a confiança desaba (0,28) e o erro salta para
-# 0,5 px. Perto de 30% ainda é preciso e sobra sobreposição de sobra.
-# Como isso é uma FRAÇÃO DO CAMPO, o valor se adapta sozinho à objetiva --
-# não existe mais uma constante em µm para acertar por magnificação.
+"""
+Deslocamento da medição FINAL, como fração da largura/altura da imagem.
+Por que medir de novo com outro valor, em vez de usar um número fixo:
+a precisão relativa melhora com o tamanho do deslocamento. Dois erros
+competem aqui --
+  - o erro do próprio estágio (ex: ±0,1 µm) é ABSOLUTO: num comando de
+    10 µm ele vale 1%, num de 100 µm vale 0,1%;
+  - o erro da correlação de fase (~0,03 px) também é absoluto em pixels.
+Ambos encolhem, em termos relativos, quanto maior o deslocamento. O
+limite é a sobreposição entre as duas fotos: medido em simulação, a
+partir de ~50% da largura a confiança desaba (0,28) e o erro salta para
+0,5 px. Perto de 30% ainda é preciso e sobra sobreposição de sobra.
+Como isso é uma FRAÇÃO DO CAMPO, o valor se adapta sozinho à objetiva --
+não existe mais uma constante em µm para acertar por magnificação.
+"""
 FRACAO_DO_CAMPO = 0.28
 
-# Quantas vezes repetir a medição em cada eixo, pra tirar a média
-REPETICOES = 5
+# Quantas vezes repetir a medição em cada eixo pra tirar a média
+REPETICOES = 10
 
-# Confiança mínima devolvida pelo cv2.phaseCorrelate para a medição valer.
-# Abaixo disso a repetição é DESCARTADA, não só avisada: uma medição em que
-# a correlação não achou um pico claro entra na média com o mesmo peso das
-# boas e puxa o resultado inteiro para um valor errado.
+"""
+Confiança mínima devolvida pelo cv2.phaseCorrelate para a medição valer.
+Abaixo disso a repetição é descartada
+"""
 CONFIANCA_MINIMA = 0.3
 
 
-def _para_correlacao(imagem):
+def converter_imagem(imagem):
     """Converte pra escala de cinza em float32 -- formato exigido pelo phaseCorrelate."""
 
     cinza = cv2.cvtColor(imagem, cv2.COLOR_RGB2GRAY) if imagem.ndim == 3 else imagem
@@ -60,12 +62,11 @@ def _para_correlacao(imagem):
 def medir_deslocamento_em_pixels(imagem_a, imagem_b):
     """
     Usa correlação de fase pra medir quanto a imagem_b está deslocada em relação à imagem_a.
-
     Devolve ((deslocamento_x_px, deslocamento_y_px), confianca).
     """
 
     deslocamento_px, confianca = cv2.phaseCorrelate(
-        _para_correlacao(imagem_a), _para_correlacao(imagem_b)
+        converter_imagem(imagem_a), converter_imagem(imagem_b)
     )
     return deslocamento_px, confianca
 
@@ -73,7 +74,7 @@ def medir_deslocamento_em_pixels(imagem_a, imagem_b):
 def medir_um_por_pixel(core, camera, xy_stage, eixo, deslocamento_um):
     """
     Faz {REPETICOES} medições de µm/pixel movendo o estágio só no eixo
-    indicado ('x' ou 'y') por deslocamento_um, voltando à posição original
+    indicado por deslocamento_um, voltando à posição original
     a cada repetição, e devolve a lista de medições que passaram nos
     testes de qualidade (pode ser menor que REPETICOES).
     """
@@ -88,7 +89,7 @@ def medir_um_por_pixel(core, camera, xy_stage, eixo, deslocamento_um):
 
         if eixo == "x":
             core.set_xy_position(xy_stage, x0 + deslocamento_um, y0)
-        else:
+        if eixo == "y":
             core.set_xy_position(xy_stage, x0, y0 + deslocamento_um)
         core.wait_for_device(xy_stage)
 
@@ -102,17 +103,7 @@ def medir_um_por_pixel(core, camera, xy_stage, eixo, deslocamento_um):
             imagem_a, imagem_b
         )
 
-        # MAGNITUDE do deslocamento, não a componente no eixo.
-        # Se a câmera estiver rotacionada em relação aos eixos do estágio
-        # (montagem C-mount torta, coisa banal), mover o estágio em X puro
-        # gera deslocamento nas DUAS componentes da imagem. Usar só a
-        # componente no eixo mede um valor menor que o real, e portanto
-        # devolve µm/pixel MAIOR que o real -- o que superestima o FOV.
-        # FOV superestimado faz a varredura andar mais que o campo e deixar
-        # faixas nunca fotografadas entre um tile e o próximo. A magnitude
-        # é imune à rotação: medido em simulação, com 15° de câmera torta o
-        # método antigo errava +3,6% e a magnitude, +0,04%.
-        deslocamento_px = float(np.hypot(deslocamento_x_px, deslocamento_y_px))
+        deslocamento_px = float(np.hypot(deslocamento_x_px, deslocamento_y_px)) #calcula a hipotenusa
 
         if confianca < CONFIANCA_MINIMA:
             print(
@@ -163,10 +154,6 @@ def main():
 
     try:
         # --- ETAPA 1: medição grosseira, só pra descobrir a escala ---
-        # Não dá pra escolher o deslocamento ideal sem saber quantos µm vale
-        # um pixel; e é justamente isso que se quer medir. Então mede-se uma
-        # vez com um valor conservador, e o resultado dessa medição define o
-        # deslocamento bom para a medição de verdade.
         print(f"\n--- ETAPA 1/2: medição inicial ({DESLOCAMENTO_INICIAL_UM} µm) ---")
         aproximadas = medir_um_por_pixel(
             core, camera, xy_stage, "x", DESLOCAMENTO_INICIAL_UM

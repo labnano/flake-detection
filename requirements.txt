@@ -1,4 +1,5 @@
 MaskTerial @ git+https://github.com/Jaluus/MaskTerial.git@289c7597887001f88f5d6d85d92c4653f5ca60f1
+detectron2 @ git+https://github.com/facebookresearch/detectron2.git@fd27788
 matplotlib==3.11.0
 numpy==2.4.6
 opencv-python==5.0.0.93

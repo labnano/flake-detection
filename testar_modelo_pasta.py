@@ -28,6 +28,13 @@ def main(pasta):
 
     for caminho in caminhos:
         imagem = cv2.imread(caminho)
+
+        if imagem is None:
+            # O cv2 usa a codepage ANSI e devolve None em caminho ABSOLUTO
+            # com qualquer caractere não-ASCII (o "ó" de "Códigos", por ex.).
+            print(f"\n[Erro] Não foi possível ler: {caminho}")
+            continue
+
         print(f"\nTestando: {caminho}")
         #imagem_rgb = cv2.cvtColor(imagem, cv2.COLOR_BGR2RGB)
         flakes = predictor.predict(imagem)

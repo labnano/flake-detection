@@ -9,43 +9,93 @@ import cv2
 import numpy as np
 
 from capturar_imagem import capturar_imagem
+from parametros import (
+    SIGMA_FINA_MIN,
+    SIGMA_FINA_MAX,
+    SIGMA_GROSSA_MIN,
+    SIGMA_GROSSA_MAX,
+    REDUCAO_BANDA_GROSSA,
+)
+"""
+Limite de condicionamento aceitável para os ajustes de foco.
 
-# Limite de condicionamento aceitável para os ajustes de foco.
-#
-# O número de condição da matriz de projeto é o FATOR DE AMPLIFICAÇÃO do
-# erro dos pontos de calibração no resultado: com cond = 1e6, um erro
-# humano de 0,4 µm ao focar um ponto vira até 4e5 µm no Z previsto.
-#
-# O que estraga o condicionamento é a falta de NÍVEIS -- a quantidade de
-# valores distintos que cada coordenada assume no conjunto de pontos --, e
-# não a regularidade do arranjo. Para estimar grau d num eixo são precisos
-# d+1 níveis nesse eixo: o plano (grau 1) exige 2, a quadrática (grau 2)
-# exige 3. O motivo é direto: com só 2 níveis, ux² pode ser interpolado
-# exatamente por uma reta em ux, então a coluna ux² vira combinação linear
-# das colunas ux e 1s e a matriz fica SINGULAR -- não apenas mal
-# condicionada. É o caso dos quatro cantos de um retângulo (2 níveis em
-# cada eixo) e o de um grid 5x2 (2 níveis em Y): ambos medem cond ~1e16.
-#
-# Um teste de posto não substitui esta verificação. Ele pega o caso
-# exatamente singular, mas não o "quase", que é o que aparece na prática
-# quando os pontos estão só PERTO de degenerados -- ali o posto dá 6,
-# cheio, e o ajuste passa devolvendo lixo. Para referência: um grid 3x3
-# regular dá cond ~4, e 10 pontos sorteados ao acaso, ~11.
+O número de condição da matriz de projeto é o FATOR DE AMPLIFICAÇÃO do
+erro dos pontos de calibração no resultado: com cond = 1e6, um erro
+humano de 0,4 µm ao focar um ponto vira até 4e5 µm no Z previsto.
+"""
 LIMITE_CONDICIONAMENTO = 1e4
 
+def medir_foco_relativo(imagem):
+    """Mede o quanto a imagem está em foco de um jeito COMPARÁVEL entre
+    campos diferentes -- que é justamente o que a medir_nitidez não faz.
+
+    Devolve a razão entre a energia de duas faixas de escala da própria
+    imagem: a fina (1 a 4 px), que o desfoque mata primeiro, e a grossa
+    (8 a 32 px), que ele quase não toca. Como as duas crescem juntas com a
+    quantidade de estrutura no campo e com o contraste, esses dois fatores
+    se cancelam na divisão e sobra uma grandeza adimensional que responde
+    a foco.
+
+    É por isso que aqui cabe um limiar fixo e na medir_nitidez não cabe:
+    um campo com detrito fino pode pontuar 100x mais nitidez que um campo
+    com um flake grande e liso, ambos em foco perfeito -- mas os dois dão
+    razão parecida.
+
+    NÃO substitui a medir_nitidez: dentro do autofocar, onde se compara o
+    MESMO campo em vários Z, a nitidez bruta é a métrica certa e mais
+    sensível. Esta serve para decidir SE vale chamar o autofocar.
+
+    Devolve NaN quando não há denominador (campo uniforme, saturado, tampa
+    fechada). NaN é honesto onde um número seria invenção -- e tem a
+    propriedade útil de que `nan < limiar` é False em Python, então um
+    gatilho escrito assim simplesmente não dispara nesses casos."""
+
+    cinza = imagem if imagem.ndim == 2 else cv2.cvtColor(imagem, cv2.COLOR_RGB2GRAY)
+    # float32 antes de qualquer subtração: em uint8, 1 - 255 daria 2 por
+    # overflow, e a banda passa-banda viraria lixo.
+    cinza = cinza.astype(np.float32)
+
+    # Banda fina: precisa da resolução total. É exatamente o detalhe de 1 a
+    # 4 px que o desfoque apaga -- reduzir a imagem aqui apagaria o sinal.
+    # Kernels pequenos (7 e 25 px), então o custo já é baixo.
+    fina = (
+        cv2.GaussianBlur(cinza, (0, 0), SIGMA_FINA_MIN)
+        - cv2.GaussianBlur(cinza, (0, 0), SIGMA_FINA_MAX)
+    )
+
+    # Banda grossa: medida na imagem reduzida (ver REDUCAO_BANDA_GROSSA).
+    # INTER_AREA é a interpolação correta para DIMINUIR: ela tira a média
+    # do bloco de pixels, o que já funciona como filtro anti-aliasing. Usar
+    # INTER_LINEAR aqui deixaria alias entrar e sujar a medida.
+    # Os sigmas são divididos pelo mesmo fator para representarem a mesma
+    # escala FÍSICA na imagem menor.
+    pequena = cv2.resize(
+        cinza,
+        None,
+        fx=1.0 / REDUCAO_BANDA_GROSSA,
+        fy=1.0 / REDUCAO_BANDA_GROSSA,
+        interpolation=cv2.INTER_AREA,
+    )
+    grossa = (
+        cv2.GaussianBlur(pequena, (0, 0), SIGMA_GROSSA_MIN / REDUCAO_BANDA_GROSSA)
+        - cv2.GaussianBlur(pequena, (0, 0), SIGMA_GROSSA_MAX / REDUCAO_BANDA_GROSSA)
+    )
+
+    energia_grossa = float(grossa.std())
+
+    # Guarda puramente aritmética contra divisão por zero -- não é um
+    # julgamento sobre a amostra. Quem decide se o campo tem estrutura de
+    # verdade continua sendo a medir_textura.
+    if energia_grossa < 1e-6:
+        return float("nan")
+
+    return float(fina.std()) / energia_grossa
 
 def _matriz_projeto(xs, ys, tipo):
-    """Monta a matriz de projeto do ajuste de foco para as coordenadas
+    """
+    Monta a matriz de projeto do ajuste de foco para as coordenadas
     dadas e devolve (matriz, x0, y0, escala).
-
-    Vive numa função própria porque o condicionamento precisa ser medido
-    em DOIS momentos: no ajuste, com os pontos que o usuário de fato
-    focou, e ANTES da coleta, só com as coordenadas sugeridas -- é isso
-    que permite avisar sobre uma geometria ruim enquanto ainda dá tempo de
-    mudar, em vez de recusar tudo depois de dez focagens manuais. Como o
-    condicionamento não depende de Z, os dois cálculos são o mesmo; se
-    cada lugar montasse a sua própria matriz, o aviso prévio e a recusa
-    final poderiam discordar."""
+    """
 
     xs = np.asarray(xs, dtype=float)
     ys = np.asarray(ys, dtype=float)
@@ -61,12 +111,6 @@ def _matriz_projeto(xs, ys, tipo):
         # há coluna de 1s aqui: o z0 já é a média dos Z.
         return np.column_stack([dx, dy]), x0, y0, 1.0
 
-    # Normaliza as coordenadas ANTES de montar a matriz, para que as
-    # colunas fiquem na mesma ordem de grandeza: sem isso, numa área de
-    # ~500 µm, dx fica nas centenas e dx² nas centenas de milhares. Isso
-    # melhora o condicionamento cerca de 25x (medido: 2,5e8 -> 9,8e6).
-    # Sozinho NÃO resolve: o que domina é a geometria dos pontos, não a
-    # escala das unidades -- ver LIMITE_CONDICIONAMENTO.
     escala = float(max(np.abs(dx).max(), np.abs(dy).max()))
 
     if escala == 0:
@@ -167,9 +211,9 @@ def calibrar_superficie_foco(pontos, verboso=True):
     if len(pontos) < 6:
         raise ValueError(
             "ERRO: A superfície quadrática tem 6 coeficientes e precisa de pelo "
-            "menos 6 pontos. Na prática, use mais -- com exatamente 6 o ajuste "
-            "passa exatamente por eles e reproduz o erro de cada um sem nenhuma "
-            "média para amortecê-lo."
+            "menos 6 pontos. Na prática, use mais: com exatamente 6 o ajuste "
+            "passa por todos eles e reproduz o erro de foco de cada um, sem "
+            "nenhuma média para amortecer."
         )
 
     xs = pontos[:, 0]
@@ -184,12 +228,11 @@ def calibrar_superficie_foco(pontos, verboso=True):
         raise ValueError(
             "ERRO: Os pontos de calibração estão mal distribuídos para a "
             f"superfície quadrática (condicionamento {condicionamento:.1e}, "
-            f"limite {LIMITE_CONDICIONAMENTO:.0e}). Nesse estado, o erro ao "
-            "focar cada ponto seria amplificado por esse fator no Z previsto. "
-            "A causa quase sempre é falta de níveis: a quadrática precisa de "
-            "pelo menos 3 valores DISTINTOS de X e 3 de Y entre os pontos. "
-            "Quatro cantos, uma fileira ou uma diagonal não atendem a isso, "
-            "por mais pontos que se acrescente sobre o mesmo padrão."
+            f"limite {LIMITE_CONDICIONAMENTO:.0e}).\n"
+            "Duas causas possíveis: (a) faltam níveis -- a quadrática precisa "
+            "de pelo menos 3 valores DISTINTOS de X e 3 de Y entre os pontos; "
+            "(b) a área marcada é alongada demais para a quadrática, e nesse "
+            "caso a saída é usar o plano."
         )
 
     coeficientes, _, _, _ = np.linalg.lstsq(matriz_teste, zs, rcond=None)
@@ -216,21 +259,13 @@ def calibrar_superficie_foco(pontos, verboso=True):
 
 
 def reajustar_modelo_foco(pontos, tipo):
-    """Re-ajusta o modelo de foco com todos os pontos acumulados até agora:
+    """
+    Reajusta o modelo de foco com todos os pontos acumulados até agora:
     os coletados à mão no início mais os medidos pelo autofoco durante a
     varredura.
 
-    É isso que faz o modelo melhorar sozinho ao longo da varredura, em vez
-    de depender de um offset escalar único -- um escalar aprendido numa
-    posição só vale perto dela, e é justamente por isso que o foco se perde
-    depois de uma translação grande.
-
-    Devolve None (em vez de levantar erro) se o ajuste não for possível:
-    poucos pontos, ou pontos ainda alinhados -- o que acontece de verdade
-    enquanto a varredura não saiu da primeira coluna, já que todos os
-    pontos medidos têm o mesmo X. Quem chama decide o que fazer; derrubar
-    a varredura por causa de um refinamento que falhou seria péssimo
-    negócio depois de horas de microscópio."""
+    É isso que faz o modelo melhorar sozinho ao longo da varredura.
+    """
 
     try:
         if tipo == "quadratica":
@@ -243,10 +278,6 @@ def reajustar_modelo_foco(pontos, tipo):
 
 
 def calcular_z(x, y, modelo_foco):
-
-    # A escala é a mesma usada no ajuste (1.0 para o plano). Sem dividir
-    # aqui também, os coeficientes da superfície quadrática seriam aplicados
-    # a coordenadas de outra ordem de grandeza e o Z sairia absurdo.
     escala = modelo_foco.get("escala", 1.0)
 
     dx = (x - modelo_foco["x0"]) / escala
@@ -274,10 +305,6 @@ def _imprimir_modelo_foco(modelo_foco, pontos):
     else:
         print("\n--- PLANO DE FOCO AJUSTADO ---")
 
-    # Os coeficientes são ajustados em coordenadas normalizadas (ver
-    # calibrar_superficie_foco). Aqui eles são convertidos de volta para
-    # µm para que os números impressos tenham significado físico direto:
-    # dZ/dX em µm de foco por µm de deslocamento.
     escala = modelo_foco.get("escala", 1.0)
 
     print(f"x0 = {modelo_foco['x0']:.3f}")
@@ -305,18 +332,11 @@ def _imprimir_modelo_foco(modelo_foco, pontos):
 
 
 def _melhor_grid(qtd, minimo_niveis):
-    """Escolhe (nx, ny): o maior grid com nx*ny <= qtd em que ambos os
+    """
+    Escolhe (nx, ny): o maior grid com nx*ny <= qtd em que ambos os
     eixos tenham pelo menos minimo_niveis níveis. Empates são resolvidos
     pelo arranjo mais próximo de quadrado.
-
-    Por que o maior grid que CABE, e não o menor que cobre: sobra é fácil
-    de resolver -- os pontos excedentes vão para os centros das células e
-    não mexem nos níveis existentes. Falta obrigaria a remover pontos do
-    grid, e remover pode derrubar um nível e tornar a matriz singular,
-    que é exatamente o que se está tentando evitar.
-
-    Devolve None quando nenhum grid cabe. Isso só acontece no plano com 3
-    pontos, já que o menor grid possível ali (2x2) já são 4."""
+    """
 
     melhor = None
 
@@ -325,10 +345,6 @@ def _melhor_grid(qtd, minimo_niveis):
             if nx * ny > qtd:
                 continue
 
-            # Critério, nesta ordem: aproveitar o máximo de pontos dentro
-            # do grid e, entre os empates, equilibrar os níveis entre os
-            # eixos. Um 3x7 mediria a curvatura em Y com sete níveis e a
-            # de X com o mínimo de três, gastando pontos à toa.
             chave = (nx * ny, -abs(nx - ny))
 
             if melhor is None or chave > melhor[0]:
@@ -362,20 +378,17 @@ def _ordenar_serpentina(pontos):
 
 
 def sugerir_pontos_calibracao(malha, qtd, tipo):
-    """Sugere qtd coordenadas (X, Y) bem distribuídas pela área que a
+    """
+    Sugere qtd coordenadas (X, Y) bem distribuídas pela área que a
     varredura vai de fato percorrer.
 
-    A ideia é tirar do usuário a escolha da GEOMETRIA -- onde o erro
-    humano é sistemático e caro, já que os padrões intuitivos (quatro
-    cantos, uma fileira, a diagonal) são justamente os singulares -- e
-    deixar com ele só o que exige o olho no ocular: achar o foco. Como o
-    condicionamento não depende de Z, o arranjo inteiro pode ser conferido
-    aqui, antes de o usuário focar o primeiro ponto.
+    A ideia é tirar do usuário a escolha da GEOMETRIA dos pontos a serem coletados
 
     Devolve um dicionário com os pontos já na ordem de visita, a descrição
     do arranjo, o condicionamento previsto e o espaçamento do grid -- este
     último serve para dizer ao usuário quanto ele pode se afastar de um
-    alvo sem estragar o ajuste."""
+    alvo sem estragar o ajuste.
+    """
 
     malha_x = malha["malha_x"]
     malha_y = malha["malha_y"]
@@ -400,15 +413,12 @@ def sugerir_pontos_calibracao(malha, qtd, tipo):
         y_min -= malha["passo_y"] / 2
         y_max += malha["passo_y"] / 2
 
-    # Grau 1 precisa de 2 níveis por eixo, grau 2 precisa de 3.
-    # Ver LIMITE_CONDICIONAMENTO.
+
     minimo_niveis = 3 if tipo == "quadratica" else 2
 
     grid = _melhor_grid(qtd, minimo_niveis)
 
     if grid is None:
-        # Só o plano com 3 pontos chega aqui, e para ele o triângulo largo
-        # é o arranjo ótimo (cond ~1,15 numa área quadrada).
         pontos = [
             (x_min, y_min),
             (x_max, y_min),
@@ -430,8 +440,7 @@ def sugerir_pontos_calibracao(malha, qtd, tipo):
 
         if faltam:
             # Os pontos que sobram vão para os centros das células: eles
-            # acrescentam níveis intermediários em vez de mexer nos que já
-            # existem, então nunca pioram o condicionamento.
+            # acrescentam níveis intermediários em vez de mexer nos que já existem
             centros = [
                 (float((xs[i] + xs[i + 1]) / 2), float((ys[j] + ys[j + 1]) / 2), i + j)
                 for i in range(nx - 1)
@@ -461,25 +470,16 @@ def sugerir_pontos_calibracao(malha, qtd, tipo):
 
 
 def coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos, malha=None, tipo="plano"):
-    """Pede a quantidade de pontos de calibração e depois coleta cada um.
+    """
+    Pede a quantidade de pontos de calibração e depois coleta cada um.
 
     Com malha=None mantém o modo manual: o usuário escolhe sozinho onde
     colocar cada ponto. Recebendo a malha, o script passa a SUGERIR as
     posições e a levar o estágio até elas em XY -- ao usuário resta só
     ajustar o foco.
 
-    O script nunca toca no Z. Antes da calibração ele não sabe onde está a
-    superfície da amostra, e descer a objetiva às cegas arrisca bater
-    nela; a partir de três pontos ele passa a IMPRIMIR uma estimativa de
-    Z, que é informação, não movimento.
-
-    O alvo sugerido é um alvo, não uma obrigação: caindo num pedaço vazio
-    do substrato, o usuário move até onde houver estrutura focável. O que
-    entra na lista é sempre a posição REAL lida do estágio, nunca a
-    sugerida -- gravar a teórica introduziria um erro em X e Y que o
-    ajuste depois interpretaria como variação de foco.
-
-    Retorna a lista de pontos (X, Y, Z) coletados."""
+    Retorna a lista de pontos (X, Y, Z) coletados.
+    """
 
     while True:
         entrada = input(f"Quantos pontos serão utilizados para ajustar a varredura? (Mínimo {minimo_pontos}): ")
@@ -603,18 +603,15 @@ def coletar_pontos_calibracao(core, xy_stage, z_stage, minimo_pontos, malha=None
 
 
 def gerar_malha_varredura(core, xy_stage, fov_x, fov_y, sobreposicao=0.0):
-    """Pede o ponto inicial e final da área a varrer e gera a malha de
+    """
+    Pede o ponto inicial e final da área a varrer e gera a malha de
     posições (X, Y) cobrindo essa área.
 
-    O espaçamento entre posições é o campo de visão MENOS a sobreposição:
-    com sobreposicao=0.1 o estágio avança 90% do campo a cada passo, e
-    tiles vizinhos compartilham uma faixa de 10%. Isso evita que um flake
-    em cima da divisa seja cortado em dois pedaços medidos separadamente.
+    O espaçamento entre posições é o campo de visão MENOS a sobreposição
 
     Retorna um dicionário com a malha, o passo usado e os dados que a
-    geraram. O passo é devolvido porque quem monta o mosaico depois
-    precisa dele: sem saber o passo, o montador encaixaria os tiles como
-    se fossem adjacentes e duplicaria a faixa sobreposta."""
+    geraram.
+    """
 
     print("--- CONFIGURAÇÃO DE MAPEAMENTO ---")
 
@@ -644,8 +641,8 @@ def gerar_malha_varredura(core, xy_stage, fov_x, fov_y, sobreposicao=0.0):
     passo_x = fov_x * (1.0 - sobreposicao)
     passo_y = fov_y * (1.0 - sobreposicao)
 
-    qtd_passos_x = math.ceil(dist_x / passo_x)
-    qtd_passos_y = math.ceil(dist_y / passo_y)
+    qtd_passos_x = max(1, math.ceil(dist_x / passo_x))
+    qtd_passos_y = max(1, math.ceil(dist_y / passo_y))
 
     malha_x = [x_inicial + (i * passo_x * direcao_x) for i in range(qtd_passos_x)]
     malha_y = [y_inicial + (j * passo_y * direcao_y) for j in range(qtd_passos_y)]
@@ -673,15 +670,10 @@ def gerar_malha_varredura(core, xy_stage, fov_x, fov_y, sobreposicao=0.0):
 
 
 def salvar_metadados_varredura(diretorio, malha, fov_x, fov_y):
-    """Grava na pasta da varredura o que o montar_mosaico.py precisa saber
+    """
+    Grava na pasta da varredura o que o montar_mosaico.py precisa saber
     para remontar a amostra na escala certa.
-
-    Por que num arquivo, em vez de o montador simplesmente ler a constante
-    SOBREPOSICAO do parametros.py: se você mudar essa constante entre rodar
-    a varredura e montar o mosaico, o montador usaria o valor NOVO em
-    imagens tiradas com o valor ANTIGO, e o mosaico sairia desalinhado sem
-    nenhum aviso. Gravado aqui junto das imagens, o arquivo descreve o que
-    aquela varredura de fato fez, e não o que o parametros.py diz hoje."""
+    """
 
     metadados = {
         "fov_x": fov_x,
@@ -719,11 +711,6 @@ def medir_nitidez(imagem):
 def medir_textura(imagem):
     """Mede quanta estrutura REAL existe na imagem -- serve para decidir se
     faz sentido rodar autofoco neste campo.
-
-    É um filtro passa-banda: alisar com sigma pequeno derruba o ruído do
-    sensor (alta frequência) e subtrair uma versão muito borrada derruba a
-    vinhetagem e o gradiente de iluminação (baixa frequência). Sobra só a
-    estrutura de escala intermediária, que é o que os flakes são.
 
     Ao contrário da medir_nitidez, esse valor quase não muda com o foco:
     um campo com flakes continua pontuando alto mesmo bem desfocado. É

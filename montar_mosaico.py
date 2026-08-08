@@ -225,6 +225,23 @@ def main():
         fracao_x = fracao_y = 1.0
         print("(sem varredura.json -- assumindo tiles adjacentes, sem sobreposição)")
 
+    if metadados:
+        grid_declarado_x = metadados.get("grid_x")
+        grid_declarado_y = metadados.get("grid_y")
+
+        if grid_declarado_x and grid_declarado_y:
+            if (grid_declarado_x, grid_declarado_y) != (grid_x, grid_y):
+                print(
+                    f"[Aviso] varredura.json declara grade "
+                    f"{grid_declarado_x} x {grid_declarado_y}, mas os arquivos "
+                    f"cobrem {grid_x} x {grid_y}. A varredura não chegou ao fim -- "
+                    "o mosaico sai no tamanho declarado, com as posições "
+                    "faltantes pretas."
+                )
+
+            grid_x = max(grid_x, grid_declarado_x)
+            grid_y = max(grid_y, grid_declarado_y)
+
     # Recorte em pixels da imagem ORIGINAL. Fica-se com o canto onde o tile
     # começa: a região [i*passo, (i+1)*passo] é a parte que pertence a este
     # tile, e o resto já é coberto pelo vizinho seguinte.
@@ -302,6 +319,24 @@ def main():
     # flush força o sistema operacional a gravar em disco o que ainda estiver
     # em buffer -- sem isso o arquivo pode ficar incompleto.
     mosaico.flush()
+
+    caminho_json = os.path.join(pasta, "mosaico.json")
+
+    with open(caminho_json, "w", encoding="utf-8") as arquivo:
+        json.dump(
+            {
+                "fator_reducao": FATOR_REDUCAO,
+                "recorte_x": recorte_x,
+                "recorte_y": recorte_y,
+                "largura_tile_final": largura,
+                "altura_tile_final": altura,
+                "grid_x": grid_x,
+                "grid_y": grid_y,
+            },
+            arquivo,
+            indent=2,
+            ensure_ascii=False,
+        )
 
     print(f"\nSucesso! Mosaico salvo em: {caminho_saida}")
 

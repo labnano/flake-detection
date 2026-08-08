@@ -9,8 +9,7 @@ Exposição: testa uma lista de exposições candidatas e escolhe a que
 melhor equilibra "não ficar escura demais" com "não estourar o brilho",
 olhando direto o histograma de intensidade da imagem.
 
-No final, o script mostra os valores encontrados -- copie-os para o
-início do deteccao.py (core.set_exposure / core.set_property WhiteBalance...).
+No final, o script mostra os valores encontrados -- copie-os para o parâmetros.py
 """
 
 from pycromanager import Core
@@ -20,7 +19,7 @@ import numpy as np
 from capturar_imagem import capturar_imagem
 
 # Exposições a testar, em ms. Ajuste essa lista conforme a faixa que faz sentido para objetiva.
-EXPOSICOES = list(range(5,26,1))
+EXPOSICOES = list(range(3,26,1))
 
 # Exposição usada só durante a etapa de balanço de branco
 EXPOSICAO_PARA_BALANCO = 10.0
@@ -48,9 +47,7 @@ def limitar_ao_intervalo_permitido(core, camera, nome_propriedade, valor):
 def _sair_do_zero_se_preciso(core, camera, nome_propriedade, valor_atual):
     """O ajuste em calibrar_balanco_de_branco é multiplicativo (valor * (1 +
     taxa*erro)): se valor_atual for exatamente 0, a correção fica travada em
-    0 pra sempre, não importa o erro (0 vezes qualquer coisa é 0). Dá um
-    empurrão pequeno (1% do limite superior da propriedade) pra sair do
-    zero nesse caso; dali em diante o ajuste multiplicativo normal assume."""
+    0 pra sempre, não importa o erro (0 vezes qualquer coisa é 0)."""
 
     if valor_atual != 0:
         return valor_atual
@@ -65,8 +62,7 @@ def calibrar_balanco_de_branco(core, camera):
     """
     Ajusta WhiteBalanceRed/WhiteBalanceBlue por tentativa proporcional:
     mede o quanto R e B estão desequilibrados em relação a G, corrige na
-    direção certa, mede de novo, repete até convergir (ou até acabar as
-    iterações).
+    direção certa, mede de novo, repete até convergir.
 
     Isso evita ter que saber de antemão a escala exata da propriedade da
     câmera -- só assume que "aumentar o valor da propriedade aumenta a
@@ -194,8 +190,7 @@ def main():
     print(f"WhiteBalanceBlue = {valor_b}")
     print(f"Exposição        = {exposicao_escolhida} ms")
     print(
-        "\nCopie esses valores para o início do deteccao.py "
-        "(core.set_exposure / core.set_property WhiteBalance...)."
+        "\nCopie esses valores para o parametros.py"
     )
 
 

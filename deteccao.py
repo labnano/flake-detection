@@ -24,6 +24,8 @@ from comandos import (
     medir_textura,
     reajustar_modelo_foco,
     salvar_metadados_varredura,
+    medir_foco_relativo,
+    medir_nitidez,
 )
 
 predictor = obter_predictor()
@@ -38,10 +40,8 @@ diretorio_saida = os.path.join(DIRETORIO_SAIDA_BASE, "Deteccao_" + timestamp)
 #             remontar a amostra.
 diretorio_saida_flakes = os.path.join(diretorio_saida, "flakes")
 diretorio_saida_mosaico = os.path.join(diretorio_saida, "mosaico")
-diretorio_conferencia = os.path.join(diretorio_saida, "conferencia")
 
 os.makedirs(diretorio_saida, exist_ok=True)
-os.makedirs(diretorio_conferencia, exist_ok=True)
 os.makedirs(diretorio_saida_flakes, exist_ok=True)
 os.makedirs(diretorio_saida_mosaico, exist_ok=True)
 
@@ -49,7 +49,31 @@ arquivo_log = os.path.join(diretorio_saida, "coordenadas_flakes_" + timestamp + 
 
 with open(arquivo_log, mode='w', newline='', encoding='utf-8-sig') as file:
     writer = csv.writer(file, delimiter=';')
-    writer.writerow(["Nome_Arquivo", "X", "Y", "Z", "Qtd_Flakes", "caminho"])
+    # X0/Y0 são a posição do tile (i=0, j=0), a origem da grade. Repetida em
+    # toda linha de propósito: assim o CSV é autossuficiente e dá para
+    # converter X/Y em coordenadas relativas sem precisar do varredura.json
+    # nem de adivinhar onde a varredura começou.
+    writer.writerow(["Nome_Arquivo", "X", "Y", "Z", "X0", "Y0", "Qtd_Flakes", "caminho"])
+
+# --- REGISTRO DE MÉTRICAS DE FOCO (fase de calibração) ---
+# Enquanto True, mede razão, textura e nitidez em TODA posição e grava num
+# CSV separado. Não muda nenhuma decisão da varredura -- é só instrumentação.
+# O objetivo é descobrir qual limiar de razão separa "em foco" de
+# "desfocado" NESTA amostra, com ESTA objetiva, em vez de chutar.
+# Depois de calibrado, ponha False: a textura e a nitidez rodam em
+# resolução total e não valem o custo em toda posição.
+REGISTRAR_METRICAS = False
+
+arquivo_metricas = os.path.join(diretorio_saida, "metricas_foco_" + timestamp + ".csv")
+
+if REGISTRAR_METRICAS:
+    with open(arquivo_metricas, mode='w', newline='', encoding='utf-8-sig') as file:
+        writer = csv.writer(file, delimiter=';')
+        writer.writerow([
+            "Contador", "i", "j", "X", "Y", "Z_previsto",
+            "Razao", "Textura", "Nitidez",
+            "Autofocou", "Z_medido", "Correcao", "Confiavel",
+        ])
 
 # --- CONFIGURAÇÕES DE AUTOFOCO (parte B) ---
 # A cada INTERVALO_AUTOFOCO imagens, em vez de confiar só no modelo de
@@ -88,6 +112,11 @@ dist_x = malha["dist_x"]
 dist_y = malha["dist_y"]
 qtd_passos_x = malha["qtd_passos_x"]
 qtd_passos_y = malha["qtd_passos_y"]
+
+# Origem da grade: a posição do tile (i=0, j=0). Vai em toda linha do CSV
+# para servir de referência de coordenadas relativas.
+x0_grade = malha_x[0]
+y0_grade = malha_y[0]
 
 # Registra o passo real usado, para o montar_mosaico.py encaixar os tiles
 # descontando a faixa sobreposta em vez de duplicá-la.
@@ -206,6 +235,22 @@ try:
             imagem_colorida = capturar_imagem(core, camera)
             z_calculado = z_previsto
 
+            # --- instrumentação: mede, registra, e NÃO decide nada ---
+            # Os NaN são os valores de "não medido": se REGISTRAR_METRICAS
+            # estiver desligado, ou se o autofoco não rodar nesta posição,
+            # a linha do CSV mostra nan em vez de um zero enganoso.
+            razao = float("nan")
+            textura = float("nan")
+            nitidez = float("nan")
+            z_medido = float("nan")
+            autofocou = 0
+            confiavel = ""
+
+            if REGISTRAR_METRICAS:
+                razao = medir_foco_relativo(imagem_colorida)
+                textura = medir_textura(imagem_colorida)
+                nitidez = medir_nitidez(imagem_colorida)
+
             # 4. Checkpoint de foco. O j == 0 existe porque o estágio acabou
             # de voltar de y_max para y_min começando uma coluna nova, e é
             # onde o foco mais se perdia.
@@ -222,7 +267,7 @@ try:
                     z_medido, imagem_medida, confiavel = autofocar(
                         core, z_stage, camera, z_previsto, AUTOFOCO_FAIXA_UM, AUTOFOCO_PASSO_UM
                     )
-
+                    autofocou = 1
                     if not confiavel:
                         # Melhor Z na ponta da faixa: o foco real está fora
                         # do alcance da busca. Descarta e volta pro previsto.
@@ -261,16 +306,7 @@ try:
                                 f"modelo não re-ajustado, usando offset {ajuste_z:+.3f}"
                             )
 
-            if j % 20 == 0:
-                nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
-                caminho_completo = os.path.join(diretorio_conferencia, nome_arquivo)
-
-                # 5. Salva a matriz no formato nativo, sem corromper os bits.
-                # imagem_colorida já é RGB (confirmado comparando um arquivo
-                imwrite(caminho_completo, imagem_colorida)
-                print(f"Salvo arquivo de conferência: {caminho_completo}")
-
-            # 6. Detecção
+            # 5. Detecção
             # O MaskTerial espera BGR (ver FlakeClass.py), então convertemos
             # antes de mandar pro modelo. ascontiguousarray é necessário porque
             # a inversão de canais [:, :, ::-1] gera um array com stride
@@ -301,7 +337,11 @@ try:
                 # Registra no CSV
                 with open(arquivo_log, mode='a', newline='', encoding='utf-8-sig') as file:
                     writer = csv.writer(file, delimiter=';')
-                    writer.writerow([nome_arquivo, n, m, z_calculado, len(flakes), f"{diretorio_saida_flakes}"])
+                    writer.writerow([
+                        nome_arquivo, n, m, z_calculado,
+                        x0_grade, y0_grade,
+                        len(flakes), f"{diretorio_saida_flakes}",
+                    ])
 
                 print(
                     f"SUCESSO: {len(flakes)} flake(s) em "
@@ -315,6 +355,23 @@ try:
                 caminho_mosaico = os.path.join(diretorio_saida_mosaico, nome_arquivo)
                 imwrite(caminho_mosaico, imagem_colorida)
 
+            if REGISTRAR_METRICAS:
+                with open(arquivo_metricas, mode='a', newline='', encoding='utf-8-sig') as file:
+                    writer = csv.writer(file, delimiter=';')
+                    writer.writerow([
+                        contador_imagem, i, j,
+                        f"{n:.2f}", f"{m:.2f}", f"{z_previsto:.3f}",
+                        f"{razao:.4f}", f"{textura:.3f}", f"{nitidez:.2f}",
+                        autofocou,
+                        f"{z_medido:.3f}",
+                        # A coluna que realmente importa: o quanto o modelo
+                        # de foco ERROU nesta posição, medido pelo autofoco.
+                        # O limiar de razão é o valor que melhor separa as
+                        # linhas com |Correcao| grande das com |Correcao|
+                        # pequena. Fica nan onde o autofoco não rodou.
+                        f"{z_medido - z_previsto:.3f}",
+                        int(confiavel) if autofocou else "",
+                    ])
     print("\nVarredura totalmente concluída.")
 
     # A montagem do mosaico NÃO acontece aqui de propósito: ela é a etapa
@@ -327,7 +384,7 @@ try:
     print(f'    python montar_mosaico.py "{diretorio_saida}"')
 
 finally:
-    # 7. Retorno à origem, sempre executado (mesmo se algo tiver falhado acima).
+    # 6. Retorno à origem, sempre executado (mesmo se algo tiver falhado acima).
     print("\nRetornando o estágio à posição inicial...")
     core.set_xy_position(xy_stage, x_inicial, y_inicial)
     core.wait_for_device(xy_stage)

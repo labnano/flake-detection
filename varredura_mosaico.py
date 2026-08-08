@@ -3,7 +3,13 @@ from tifffile import imwrite
 from pycromanager import Core
 import datetime
 from caminhos import DIRETORIO_SAIDA_BASE
-from parametros import FOV_MOSAICO, EXPOSICAO_MOSAICO, SOBREPOSICAO
+from parametros import (
+    FOV_MOSAICO,
+    EXPOSICAO_MOSAICO,
+    SOBREPOSICAO,
+    WHITE_BALANCE_RED,
+    WHITE_BALANCE_BLUE,
+)
 from capturar_imagem import capturar_imagem
 from comandos import (
     calibrar_plano_foco,
@@ -11,6 +17,7 @@ from comandos import (
     coletar_pontos_calibracao,
     gerar_malha_varredura,
     autofocar,
+    medir_textura,
     salvar_metadados_varredura,
 )
 
@@ -26,6 +33,15 @@ from comandos import (
 INTERVALO_AUTOFOCO = 20
 AUTOFOCO_FAIXA_UM = 3.0   # quantos µm pra cada lado do Z previsto ele varre
 AUTOFOCO_PASSO_UM = 0.5   # espaçamento entre as fotos do stack
+
+# Textura mínima para valer a pena rodar autofoco neste campo. Num campo
+# vazio a nitidez mede só o ruído do sensor. CALIBRAR: o 3.0 veio do
+# deteccao.py, que usa outra objetiva e outra exposição.
+TEXTURA_MINIMA = 3.0
+
+# Teto do offset escalar aprendido pelo autofoco, em µm. Sem ele, cada
+# checkpoint parte do Z já deslocado e o ajuste vira um passeio sem limite.
+AJUSTE_Z_MAXIMO = 5.0
 
 
 # --- CONFIGURAÇÕES DE DIRETÓRIO ---
@@ -86,6 +102,8 @@ print(f"Iniciando captura. Arquivos serão salvos em: {diretorio_saida}")
 
 
 core.set_exposure(EXPOSICAO_MOSAICO)
+core.set_property(camera, "WhiteBalanceRed", WHITE_BALANCE_RED)
+core.set_property(camera, "WhiteBalanceBlue", WHITE_BALANCE_BLUE)
 
 # O laço inteiro fica dentro de um try/finally: se der erro no meio da
 # varredura (posição inválida, câmera travou, etc.), o estágio ainda assim
@@ -104,40 +122,53 @@ try:
 
             z_previsto = calcular_z(n, m, modelo_foco) + ajuste_z
 
+            # 2. Movimentação Z direto pro valor previsto
+            core.set_position(z_stage, z_previsto)
+            core.wait_for_device(z_stage)
+
+            # 3. Captura dos dados brutos, já organizados em RGB
+            imagem_colorida = capturar_imagem(core, camera)
+
             if contador_imagem % INTERVALO_AUTOFOCO == 0:
-                # 2-3. A cada INTERVALO_AUTOFOCO imagens, refina o foco:
-                # tira um pequeno stack em Z ao redor do previsto e fica
-                # com a mais nítida, corrigindo o que o plano de foco
-                # (calibrado com só 3 pontos) não capturou.
-                z_calculado, imagem_colorida, confiavel = autofocar(
-                    core, z_stage, camera, z_previsto, AUTOFOCO_FAIXA_UM, AUTOFOCO_PASSO_UM
-                )
+                textura = medir_textura(imagem_colorida)
 
-                if confiavel:
-                    # A diferença entre o Z realmente mais nítido e o que o
-                    # modelo (sem ajuste) previa vira o novo ajuste, e passa a
-                    # valer para as próximas posições, até o próximo checkpoint.
-                    ajuste_z = z_calculado - calcular_z(n, m, modelo_foco)
-
+                if textura < TEXTURA_MINIMA:
+                    # Campo sem estrutura: aqui a nitidez mede ruído, não
+                    # foco. O autofoco devolveria um Z aleatório que
+                    # deslocaria todas as posições seguintes.
                     print(
-                        f"[Autofoco] Z ajustado para {z_calculado:.3f} "
-                        f"(ajuste acumulado: {ajuste_z:+.3f})"
+                        f"[Autofoco] pulado: campo sem textura "
+                        f"({textura:.2f} < {TEXTURA_MINIMA})"
                     )
                 else:
-                    # Melhor Z na ponta da faixa: o foco real está fora do
-                    # alcance da busca. Aceitar esse valor como ajuste
-                    # estragaria todas as posições seguintes.
-                    print(
-                        f"[Autofoco] descartado: melhor Z na borda da faixa "
-                        f"(+-{AUTOFOCO_FAIXA_UM} µm)."
+                    z_calculado, imagem_medida, confiavel = autofocar(
+                        core, z_stage, camera, z_previsto, AUTOFOCO_FAIXA_UM, AUTOFOCO_PASSO_UM
                     )
-            else:
-                # 2. Movimentação Z direto pro valor previsto
-                core.set_position(z_stage, z_previsto)
-                core.wait_for_device(z_stage)
 
-                # 3. Captura dos dados brutos, já organizados em RGB
-                imagem_colorida = capturar_imagem(core, camera)
+                    if confiavel:
+                        # A diferença entre o Z realmente mais nítido e o que o
+                        # modelo (sem ajuste) previa vira o novo ajuste, e passa a
+                        # valer para as próximas posições, até o próximo checkpoint.
+                        ajuste_z = z_calculado - calcular_z(n, m, modelo_foco)
+                        ajuste_z = max(-AJUSTE_Z_MAXIMO, min(AJUSTE_Z_MAXIMO, ajuste_z))
+                        imagem_colorida = imagem_medida
+
+                        print(
+                            f"[Autofoco] Z ajustado para {z_calculado:.3f} "
+                            f"| textura {textura:.2f} "
+                            f"(ajuste acumulado: {ajuste_z:+.3f})"
+                        )
+                    else:
+                        # Melhor Z na ponta da faixa: o foco real está fora do
+                        # alcance da busca. Aceitar esse valor como ajuste
+                        # estragaria todas as posições seguintes.
+                        core.set_position(z_stage, z_previsto)
+                        core.wait_for_device(z_stage)
+
+                        print(
+                            f"[Autofoco] descartado: melhor Z na borda da faixa "
+                            f"(+-{AUTOFOCO_FAIXA_UM} µm)."
+                        )
 
             # 4. Define o nome do arquivo dinamicamente
             nome_arquivo = f"img_pos_X{i}_Y{j}.tif"
