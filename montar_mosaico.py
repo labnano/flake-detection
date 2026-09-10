@@ -25,10 +25,14 @@ import json
 import os
 import re
 import sys
+import tkinter as tk
+from tkinter import filedialog
 
 import cv2
 import numpy as np
 import tifffile
+
+from caminhos import DIRETORIO_SAIDA_BASE
 
 # Reduz cada imagem antes de encaixar. 1 = resolução total.
 # Um mosaico de detecção (FOV_DETECCAO, tiles pequenos) pode passar
@@ -141,11 +145,11 @@ def desenhar_destaque(img, cor):
     borda do campo de visão, justamente a região que costuma sobrepor o
     tile vizinho."""
 
-    altura, largura = img.shape[:2]
+    #altura, largura = img.shape[:2]
 
     espessura = max(
         ESPESSURA_MINIMA_PX,
-        int(round(min(altura, largura) * ESPESSURA_DESTAQUE)),
+        int(8),
     )
 
     img[:espessura, :] = cor    # topo
@@ -160,9 +164,19 @@ def main():
     if len(sys.argv) > 1:
         pasta = sys.argv[1]
     else:
-        # .strip('"') porque copiar caminho no Windows costuma trazer aspas junto.
-        pasta = input("Caminho da pasta da varredura: ").strip().strip('"')
+        # Sem argumento na linha de comando, abre uma janela pra escolher a pasta.
+        raiz = tk.Tk()
+        raiz.withdraw()  # esconde a janela-raiz vazia que o tkinter sempre cria
+        pasta = filedialog.askdirectory(
+            title="Escolha a pasta da varredura",
+            initialdir=DIRETORIO_SAIDA_BASE,
+        )
+        raiz.destroy()
 
+        # askdirectory devolve "" se você fechar a janela sem escolher nada.
+        if not pasta:
+            print("Nenhuma pasta escolhida.")
+            return
     if not os.path.isdir(pasta):
         print(f"[Erro] Pasta não encontrada: {pasta}")
         return

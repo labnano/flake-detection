@@ -190,8 +190,12 @@ def main():
     print(f"WhiteBalanceBlue = {valor_b}")
     print(f"Exposição        = {exposicao_escolhida} ms")
     print(
-        "\nCopie esses valores para o parametros.py"
+        "\nCopie para o parametros.py, no OBJETIVAS, na objetiva que você acabou "
+        "de\ncalibrar (troque o 5x pela que estiver no revólver):"
     )
+    print(f'    OBJETIVAS["5x"]["exposicao"] = {exposicao_escolhida}')
+    print(f'    OBJETIVAS["5x"]["wb_red"]    = {valor_r}')
+    print(f'    OBJETIVAS["5x"]["wb_blue"]   = {valor_b}')
 
 
 if __name__ == "__main__":

@@ -11,6 +11,6 @@ modelo/
 # Configuração local da IDE
 .idea/
 
-analisar_foco_razao.py
-testar_calibracao_foco.py
 NOTAS_REVISAO.md
+
+relatorio_ajuste_deteccao.html

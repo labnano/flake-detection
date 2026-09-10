@@ -4,7 +4,7 @@ from tifffile import imwrite
 from pycromanager import Core
 import datetime
 import csv
-from modelo import obter_predictor, display_results
+from modelo import obter_predictor, display_results, filtrar_por_modelo
 from capturar_imagem import capturar_imagem
 from caminhos import DIRETORIO_SAIDA_BASE
 from parametros import (
@@ -314,6 +314,12 @@ try:
             # aceita (ValueError: "tensors with negative strides").
             imagem_bgr = np.ascontiguousarray(imagem_colorida[:, :, ::-1])
             flakes = predictor.predict(imagem_bgr)
+            # Pós-filtro: modelo treinado sobre o contraste BGR médio e a
+            # fração de pixels tipo-substrato. Separa o flake fino tanto da cola
+            # (contraste ~0) quanto do bulk (escuro nos três canais) -- o teto
+            # de contraste verde anterior só dava conta da cola. Isso muda o que
+            # conta como "posição com flake" abaixo -- de propósito.
+            flakes = filtrar_por_modelo(imagem_bgr, flakes)
 
             if flakes:
                 nome_arquivo = f"img_pos_X{i}_Y{j}.tif"

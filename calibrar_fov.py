@@ -217,11 +217,11 @@ def main():
     )
     print(f"\nFOV medido: {fov_x:.2f} x {fov_y:.2f} µm")
     print(
-        "\nCopie esse par para o parametros.py, na constante da objetiva que "
-        "você acabou de calibrar:"
+        "\nCopie esse par para o parametros.py, no OBJETIVAS, na linha 'fov' da "
+        "objetiva\nque você acabou de calibrar (troque o 5x pela que estiver no "
+        "revólver):"
     )
-    print(f"    FOV_DETECCAO = ({fov_x:.1f}, {fov_y:.1f})   # objetiva do deteccao.py")
-    print(f"    FOV_MOSAICO  = ({fov_x:.1f}, {fov_y:.1f})   # objetiva do varredura_mosaico.py")
+    print(f'    OBJETIVAS["5x"]["fov"] = ({fov_x:.1f}, {fov_y:.1f})')
 
 
 if __name__ == "__main__":
